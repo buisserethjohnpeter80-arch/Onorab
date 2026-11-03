@@ -1,0 +1,12 @@
+/* Global styles: keep the app dark and compact on small phones. */
+html,
+body {
+  background: #17181c;
+  color: #ffffff;
+}
+
+ion-tab-bar {
+  --background: #1e1f24;
+  --color: #9ca3af;
+  --color-selected: #22d3ee;
+}

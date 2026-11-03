@@ -1,0 +1,39 @@
+# Onorab — NEVER commit secrets. This file is the guard for that rule.
+# Credentials, tokens, and keys are loaded from local paths / environment
+# at runtime only. They are never compiled into the VST3 or Hub binaries.
+
+# Google OAuth / credentials (Phase 2; Phase 1 uses Mock Drive only)
+credentials.json
+client_secret*.json
+*credentials*.json
+.env
+config.json
+*.env
+
+# Tokens and key material
+*.token
+*.tokens
+token*.json
+*.key
+*.pem
+*.p12
+*.keystore
+*.jks
+google-services.json
+
+# Build outputs
+apps/onorab-hub/onorab-hub.exe
+apps/onorab-hub/onorab-hub
+build/
+out/
+node_modules/
+dist/
+*.apk
+*.aab
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.user

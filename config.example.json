@@ -1,0 +1,1 @@
+{"_notes":["Phase 1: driveProvider must be 'mock'.","credentialsPath is Phase 2 only and must point to a local file that is never committed.","The Android app must use its own Android OAuth client in Phase 2; never reuse the Desktop OAuth client there."],"cacheDir":"","credentialsPath":"","driveProvider":"mock","hubPort":18741,"hubUrl":"http://127.0.0.1:18741"}
