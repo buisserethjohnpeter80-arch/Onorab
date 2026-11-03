@@ -111,12 +111,13 @@ bool HubClient::httpGetText (const juce::String& url, juce::String& outText, juc
     }
 
     outText = stream->readEntireStreamAsString();
-    if (stream->getStatus() == juce::InputStream::Status::readError)
-    {
-        outError = "Failed while reading the Hub response from " + url;
-        DBG ("Onorab HubClient GET read error: " << url);
-        return false;
-    }
+    // NOTE (JUCE 8 fix, 2026-11-03): juce::InputStream has NO getStatus()
+    // and NO Status::readError member — the earlier code used an API that
+    // does not exist, which broke the Windows CI build (C3083/C2039).
+    // Failure detection here is: a null stream above (unreachable Hub),
+    // and callers treating an empty/unparseable body as an error.
+    // Do NOT re-add a getStatus() check without verifying it against
+    // the JUCE 8 headers first.
     return true;
 }
 
@@ -244,7 +245,10 @@ void HubClient::downloadFile (const CloudFile& file, const juce::File& cacheDir,
                         progress (total > 0 ? static_cast<double> (written) / static_cast<double> (total) : -1.0);
                 }
                 out->flush();
-                if (readFailed || stream->getStatus() == juce::InputStream::Status::readError)
+                // NOTE (JUCE 8 fix): no getStatus()/Status::readError on
+                // juce::InputStream — readFailed (negative read or failed
+                // write above) is the only failure signal here.
+                if (readFailed)
                 {
                     error = "Download was interrupted for file: " + safeName;
                     DBG ("Onorab HubClient download interrupted: " << safeName);
