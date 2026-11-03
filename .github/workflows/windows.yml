@@ -22,7 +22,7 @@ jobs:
         run: go test ./...
       - name: Build Hub
         working-directory: apps/onorab-hub
-        run: go build -trimpath -o onorab-hub.exe .
+        run: go build -trimpath -ldflags "-X main.buildOAuthClientID=${{ secrets.ONORAB_OAUTH_CLIENT_ID }}" -o onorab-hub.exe .
       - name: Configure VST3
         run: cmake -S plugins/onorab-audio -B build -G "Visual Studio 17 2022" -A x64
       - name: Build VST3
