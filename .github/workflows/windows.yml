@@ -1,0 +1,45 @@
+name: Windows
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    name: Test, build and package Windows
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.4'
+          cache: false
+      - name: Test Hub
+        working-directory: apps/onorab-hub
+        run: go test ./...
+      - name: Build Hub
+        working-directory: apps/onorab-hub
+        run: go build -trimpath -o onorab-hub.exe .
+      - name: Configure VST3
+        run: cmake -S plugins/onorab-audio -B build -G "Visual Studio 17 2022" -A x64
+      - name: Build VST3
+        run: cmake --build build --config Release --parallel
+      - name: Package Windows ZIP
+        shell: pwsh
+        run: |
+          $vst3 = "build/Onorab_artefacts/Release/VST3/Onorab.vst3"
+          $hub = "apps/onorab-hub/onorab-hub.exe"
+          if (-not (Test-Path $vst3 -PathType Container)) { throw "VST3 bundle missing" }
+          if (-not (Test-Path $hub -PathType Leaf)) { throw "Hub executable missing" }
+          New-Item -ItemType Directory -Force staging | Out-Null
+          Copy-Item -Recurse $vst3 staging/
+          Copy-Item $hub staging/
+          Compress-Archive -Path staging/* -DestinationPath onorab-windows.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: onorab-windows
+          path: onorab-windows.zip
+          if-no-files-found: error
