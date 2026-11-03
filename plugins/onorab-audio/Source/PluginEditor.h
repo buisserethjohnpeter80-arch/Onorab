@@ -37,8 +37,10 @@ class OnorabAudioProcessorEditor;
 class DragSourceComponent : public juce::Component
 {
 public:
-    // Returns the local file to drag, or an empty File if none is ready.
-    std::function<juce::File()> getFileToDrag;
+    // Returns the local files to drag (one or more taken sounds), or an
+    // empty array if none is ready yet. FL Studio receives real file
+    // paths; whether it accepts the drop is the host's decision.
+    std::function<juce::StringArray()> getFilesToDrag;
 
     void paint (juce::Graphics& g) override;
     void mouseDrag (const juce::MouseEvent& event) override;
@@ -65,6 +67,13 @@ public:
     void setCapturing (bool capturing);
     void setCaptureNote (const juce::String& text);
     void setSelectedLocalFile (const juce::File& file, bool exists);
+    // Typed capture name for the next Capture from FL ("" = auto name).
+    juce::String getCaptureName() const;
+    // Files the user selected in this list (multi-select enabled).
+    std::vector<CloudFile> getSelectedFiles() const;
+    // Local files produced by Take from Drive; these are what the
+    // violet drag box hands to FL Studio.
+    void setTakenLocalFiles (const juce::StringArray& files);
 
     void resized() override;
 
@@ -87,13 +96,19 @@ private:
     juce::TextEditor searchBox;
     juce::Label syncLabel, errorLabel, progressLabel, captureLabel, dragHintLabel;
     juce::TextButton refreshButton { "Refresh" };
-    juce::TextButton downloadButton { "Download" };
+    // No separate Download button by design (user decision 2026-11-03):
+    // Take from Drive downloads the selected sound(s) to the local
+    // cache in one step, ready to preview and to drag into FL Studio.
+    juce::TextButton takeButton { "Take from Drive" };
+    juce::TextButton deleteButton { "Delete" };
     juce::TextButton uploadButton { "Upload…" };
     juce::TextButton uploadCaptureButton { "Upload last capture" };
     juce::TextButton playButton { "Play" };
     juce::TextButton pauseButton { "Pause" };
     juce::TextButton stopButton { "Stop" };
     juce::TextButton captureButton { "Capture from FL" };
+    juce::TextEditor captureNameBox;
+    juce::Label busGuideLabel;
     juce::Slider gainSlider;
     juce::Label gainLabel;
     juce::AudioFormatManager waveformFormatManager;
@@ -101,24 +116,53 @@ private:
     DragSourceComponent dragSource;
     juce::File selectedLocalFile;
     bool selectedLocalExists = false;
+    juce::StringArray takenLocalFiles;
     bool capturing = false;
 
     std::unique_ptr<juce::FileChooser> fileChooser;
 };
 
-class ProjectsTab : public juce::Component
+// Projects tab: one project, track by track. The project name box is
+// BOTH the filter (the list shows only this project's sounds) and the
+// target for Upload / Push, which file sounds under
+// Onorab_projet/<project>/ on Drive. FL Studio cannot list its own
+// project tracks automatically (a VST sees only its Mixer Track audio),
+// so local sounds enter a project only via Upload one / Upload all /
+// Push — never by silent auto-discovery.
+class ProjectsTab : public juce::Component,
+                    public juce::ListBoxModel,
+                    private juce::TextEditor::Listener
 {
 public:
     explicit ProjectsTab (OnorabAudioProcessorEditor& editor);
-    void setCachedFiles (const std::vector<juce::String>& names);
+    void setFiles (const std::vector<CloudFile>& files);
+    std::vector<CloudFile> getSelectedFiles() const;
+    juce::String getProjectName() const;
     void resized() override;
 
+    // ListBoxModel
+    int getNumRows() override;
+    void paintListBoxItem (int rowNumber, juce::Graphics& g, int width, int height,
+                           bool rowIsSelected) override;
+    void selectedRowsChanged (int lastRowSelected) override;
+
 private:
+    void textEditorTextChanged (juce::TextEditor& editor) override;
+    void applyFilter();
+
     OnorabAudioProcessorEditor& owner;
+    std::vector<CloudFile> allFiles;
+    std::vector<CloudFile> filteredFiles;
     juce::Label infoLabel;
     juce::TextEditor projectNameBox;
-    juce::TextEditor cacheBox;
-    juce::Label projectNoteLabel;
+    juce::TextEditor searchBox;
+    juce::ListBox fileList { "Project sounds", this };
+    juce::TextButton uploadOneButton { "Upload one" };
+    juce::TextButton uploadAllButton { "Upload all" };
+    juce::TextButton pushButton { "Push" };
+    juce::TextButton deleteButton { "Delete" };
+    juce::Label noteLabel;
+    std::unique_ptr<juce::FileChooser> fileChooser;
 };
 
 class TransfersTab : public juce::Component,
@@ -147,6 +191,8 @@ public:
     explicit SettingsTab (OnorabAudioProcessorEditor& editor);
     void setValues (const juce::String& hubUrl, const juce::String& cacheDir);
     void setStatus (const juce::String& text);
+    void setDriveStatus (const juce::String& text);
+    void setInviteStatus (const juce::String& text);
     void resized() override;
 
 private:
@@ -156,6 +202,17 @@ private:
     juce::TextButton saveButton { "Save" };
     juce::TextButton browseButton { "Browse…" };
     std::unique_ptr<juce::FileChooser> dirChooser;
+    // Google Drive connect (Hub-side; real Google sign-in is Phase 2).
+    juce::Label driveLabel;
+    juce::TextEditor driveEmailBox;
+    juce::TextButton connectDriveButton { "Connect Drive" };
+    juce::Label driveStatusLabel;
+    // Invite another user to a project (Hub-side record; real Drive
+    // sharing of Onorab_projet/<project>/ is Phase 2).
+    juce::Label inviteLabel;
+    juce::TextEditor inviteEmailBox, inviteProjectBox;
+    juce::TextButton inviteButton { "Invite" };
+    juce::Label inviteStatusLabel;
 };
 
 // ---- The editor itself ----
@@ -179,8 +236,27 @@ public:
     // Called by the tabs (message thread).
     void refreshFiles();
     void onFileSelected (const CloudFile& file);
-    void downloadSelectedFile();
+    // Take from Drive: download every selected Library sound to the
+    // local cache, load the first as preview, and make all of them
+    // draggable into FL Studio. This replaces the old single Download.
+    void takeSelectedFiles();
     void uploadLocalFile (const juce::File& file);
+    void uploadLocalFile (const juce::File& file, const juce::String& project);
+    // Upload picked local files into a project folder.
+    void uploadFilesToProject (const std::vector<juce::File>& files, const juce::String& project);
+    // Push: upload the LOCAL copies of selected project sounds into
+    // the project folder (Onorab_projet/<project>/). A sound with no
+    // local copy yet is skipped with a visible message — Take it first.
+    void pushProjectFiles (const std::vector<CloudFile>& files, const juce::String& project);
+    // Delete: remove selected sounds from the Hub (Drive) AND their
+    // local cache copies (local copy only on Hub success, so a failed
+    // Hub delete keeps the recoverable local file). Permanent on the
+    // Hub side — in Mock mode a Hub restart re-seeds the 3 mock files.
+    void deleteHubFiles (const std::vector<CloudFile>& files);
+    // Settings: Drive connect + project invite (Hub-side, Phase 2 for
+    // real Google sign-in / Drive sharing; see SettingsTab notes).
+    void connectDrive (const juce::String& email);
+    void inviteToProject (const juce::String& email, const juce::String& project);
     void uploadLastCapture();
     void playPreview();
     void pausePreview();

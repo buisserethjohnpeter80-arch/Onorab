@@ -44,23 +44,58 @@ Result: `build/Onorab_artefacts/Release/VST3/Onorab.vst3/`
 4. Load it on a Mixer Track (Mixer → select a track → slot → Onorab).
 5. The Cloud Library tab shows the Hub sync status. If it says
    "Disconnected", the Hub is not running — start it and press **Refresh**.
-6. **Preview:** select a file, press **Download**, then **Play** (Pause/Stop
-   and the Preview gain slider are in the same row).
+6. **Preview:** select one or more files, press **Take from Drive**, then
+   **Play** (Pause/Stop and the Preview gain slider are in the same row).
+   There is deliberately no separate Download button: Take downloads to
+   the local cache in one step, ready to preview and drag.
 7. **Capture from FL:** play audio through that Mixer Track, press
    **Capture from FL**, then **Stop capture**. The WAV lands in the cache
    folder (default `%LOCALAPPDATA%\Onorab\cache`); press
    **Upload last capture** to send it to the Hub.
-8. **Drag to FL:** download a file, then drag the violet **Drag to FL** box
+8. **Drag to FL:** take a file, then drag the violet **Drag to FL** box
    into FL Studio (Playlist / Channel Rack). This hands FL Studio a real
    file path via JUCE external drag-and-drop.
+9. **Projects:** in the Projects tab, type a project name (e.g.
+   `marcus music`) to filter its sounds and to target **Upload one** /
+   **Upload all** / **Push**. Sounds live on Drive under
+   `Onorab_projet/<project>/`. **Push** uploads the local copies of
+   selected project sounds; a sound with no local copy is skipped
+   (Take it from the Cloud Library first). FL Studio cannot list its
+   own project tracks automatically, so local sounds enter a project
+   only via Upload or Push.
+10. **Delete:** select a sound in Cloud Library or Projects and press
+    **Delete**. It deletes the sound from the Hub (Drive) and, on Hub
+    success, its local cache copy too. Unknown ids are never silently
+    "deleted". In Mock mode a Hub restart re-seeds the 3 mock files.
+11. **Order:** sounds always appear in creation order (the order the
+    project was created, uploads appended at the end) — never
+    alphabetical. An invited user's upload from another FL Studio
+    appears at the end, in order.
+12. **Settings → Google Drive / Invite:** enter a Gmail and press
+    **Connect Drive** (in Mock mode this honestly reports that real
+    Google sign-in is not ready yet), or enter an invited Gmail +
+    project and press **Invite** (records a pending invite on the Hub;
+    real Drive sharing of `Onorab_projet/<project>/` is Phase 2).
+13. **Onorab Bus (track-by-track capture):** the plugin cannot create
+    a Mixer track or route tracks — do that by hand in FL Studio:
+    (a) pick an empty Mixer track, name it `Onorab`, load Onorab on it
+    and use it for nothing else; (b) route the track to capture to it
+    with **Route to this track only**; (c) type the track name in the
+    plugin's capture name box (e.g. `Vocal`), press **Capture from
+    FL**, then **Stop capture** — the file is named
+    `Vocal-<timestamp>.wav`; (d) **Upload last capture** or Push it
+    into a project. Route one track at a time for track-by-track, or
+    route all tracks at once for a mix capture. Remove the route
+    afterwards so the track returns to normal Master routing.
 9. **Drop to upload:** drag audio files from Explorer onto the plugin
    window to queue them for upload to the Hub.
 
 ## Hub HTTP contract used here (Phase 1)
 
 - `GET /health`, `GET /files`, `GET /transfers`, `GET /downloads/{id}`
-- `POST /uploads` — `multipart/form-data`, single field named **`file`**
-  (filename = the file name). The Hub must accept that field name.
+- `POST /uploads` — `multipart/form-data`, field named **`file`**
+  (filename = the file name) plus optional text field **`project`**
+  (stored as `projectId`; Drive folder `Onorab_projet/<project>/`).
 - **No WebSocket client in Phase 1.** The editor polls `GET /transfers`
   and `GET /health` every 2 seconds. A WebSocket `/events` client is a
   Phase 2 item; polling is the honest Phase 1 behaviour.
@@ -94,8 +129,10 @@ Result: `build/Onorab_artefacts/Release/VST3/Onorab.vst3/`
 - **No WebSocket `/events` client** — transfers/health are polled every 2 s.
 - **No real Google Drive in this plugin** — Drive sync is Hub-side; with
   the Hub's Mock Drive Provider, the library shows mock audio files.
-- **Projects are a placeholder** — names are local notes only; no project
-  model is synced to the Hub yet.
+- **Projects are Hub-synced by name only so far** — project sounds are
+  grouped by `projectId` and Push/Upload target
+  `Onorab_projet/<project>/`, but real Drive folder creation is still
+  Phase 2 (the Hub currently runs the Mock provider).
 - **Drag-out depends on the host.** The plugin provides the file path via
   JUCE external drag; FL Studio must accept the drop (its Playlist /
   Channel Rack accept audio files, but the plugin cannot force acceptance).

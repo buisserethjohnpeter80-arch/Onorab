@@ -359,3 +359,83 @@ func TestEventsWithoutUpgradeIsError(t *testing.T) {
 		t.Fatalf("status = %d, want 400 for plain GET /events", rec.Code)
 	}
 }
+
+func TestFilesOrderIsCreationOrderNotAlphabetical(t *testing.T) {
+	srv := testServer(t)
+	// Seeded order must be the seed order (voice, beat, capture), not
+	// alphabetical (beat, capture, voice): creation order is the rule.
+	rec2 := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/files", nil))
+	var files []OnorabFile
+	if err := json.Unmarshal(rec2.Body.Bytes(), &files); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"mock_voice_memo", "mock_beat_idea", "mock_fl_capture"}
+	if len(files) != len(want) {
+		t.Fatalf("files = %d, want %d", len(files), len(want))
+	}
+	for i, id := range want {
+		if files[i].ID != id {
+			t.Fatalf("files[%d].ID = %s, want %s (creation order)", i, files[i].ID, id)
+		}
+	}
+}
+
+func TestDeleteFileRemovesIt(t *testing.T) {
+	srv := testServer(t)
+	h := srv.Handler()
+	req := httptest.NewRequest(http.MethodDelete, "/files/mock_beat_idea", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/files", nil))
+	var files []OnorabFile
+	if err := json.Unmarshal(rec2.Body.Bytes(), &files); err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("files after delete = %d, want 2", len(files))
+	}
+	for _, f := range files {
+		if f.ID == "mock_beat_idea" {
+			t.Fatal("deleted file still listed")
+		}
+	}
+	rec3 := httptest.NewRecorder()
+	h.ServeHTTP(rec3, httptest.NewRequest(http.MethodDelete, "/files/mock_beat_idea", nil))
+	if rec3.Code != http.StatusNotFound {
+		t.Fatalf("second delete status = %d, want 404", rec3.Code)
+	}
+}
+
+func TestInviteCreateAndList(t *testing.T) {
+	srv := testServer(t)
+	h := srv.Handler()
+	body := strings.NewReader(`{"email":"friend@gmail.com","project":"marcus music"}`)
+	req := httptest.NewRequest(http.MethodPost, "/invites", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("invite status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/invites", nil))
+	var invites []OnorabInvite
+	if err := json.Unmarshal(rec2.Body.Bytes(), &invites); err != nil {
+		t.Fatal(err)
+	}
+	if len(invites) != 1 || invites[0].Email != "friend@gmail.com" || invites[0].Project != "marcus music" || invites[0].Status != "pending" {
+		t.Fatalf("invites = %+v, want one pending invite", invites)
+	}
+	bad := httptest.NewRequest(http.MethodPost, "/invites", strings.NewReader(`{"email":"not-an-email","project":"x"}`))
+	bad.Header.Set("Content-Type", "application/json")
+	rec3 := httptest.NewRecorder()
+	h.ServeHTTP(rec3, bad)
+	if rec3.Code != http.StatusBadRequest {
+		t.Fatalf("bad invite status = %d, want 400", rec3.Code)
+	}
+}

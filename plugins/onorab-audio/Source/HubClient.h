@@ -45,6 +45,12 @@ struct CloudFile
     int64_t sizeBytes = 0;
     juce::String updatedAt;
     juce::String mimeType;
+    // Project name from the Hub's projectId field ("" = no project yet).
+    // On Drive this maps to the folder Onorab_projet/<projectId>/ —
+    // see driveFolderFor() in the Hub. Never a path: the Hub sanitises
+    // it, and the plugin only ever displays it, never joins it to a
+    // local path without sanitiseFileName().
+    juce::String projectId;
 };
 
 struct TransferInfo
@@ -69,6 +75,10 @@ public:
     // ok + error + local file path (empty on failure).
     using DownloadCallback = std::function<void (bool ok, juce::String error, juce::File localFile)>;
     using UploadCallback = std::function<void (bool ok, juce::String error)>;
+    using DeleteCallback = std::function<void (bool ok, juce::String error)>;
+    // Auth status detail is "provider: <name>, authenticated: <0/1/true/false>".
+    using AuthCallback = std::function<void (bool ok, juce::String error, juce::String detail)>;
+    using InviteCallback = std::function<void (bool ok, juce::String error)>;
     // Progress in 0.0..1.0, or < 0 when the total size is unknown.
     // Invoked from the background thread; the caller must hop to the
     // message thread before touching UI (the editor does this).
@@ -90,8 +100,25 @@ public:
     void listTransfers (TransfersCallback cb);
     void downloadFile (const CloudFile& file, const juce::File& cacheDir,
                        DownloadCallback cb, ProgressCallback progress = nullptr);
+    // project: project name sent as the Hub's multipart "project" field
+    // ("" = no project). The Hub stores it as projectId, which maps to
+    // the Drive folder Onorab_projet/<project>/ in Phase 2.
     void uploadFile (const juce::File& file, UploadCallback cb,
-                     ProgressCallback progress = nullptr);
+                     ProgressCallback progress = nullptr,
+                     const juce::String& project = {});
+    // Delete one Hub file. The Hub accepts POST /files/{id}/delete (the
+    // plugin's proven POST path) as well as DELETE /files/{id}; the
+    // plugin uses the POST form because JUCE's URL client has no proven
+    // DELETE verb. Deleting the local cache copy is the editor's job.
+    void deleteFile (const CloudFile& file, DeleteCallback cb);
+    // Drive auth (Hub-side; Phase 2 for real Google sign-in).
+    void getAuthStatus (AuthCallback cb);
+    void startAuth (AuthCallback cb);
+    // Project invite (Hub-side record; real Drive sharing is Phase 2).
+    void sendInvite (const juce::String& email, const juce::String& project, InviteCallback cb);
+
+    // Display folder for a project, e.g. "Onorab_projet/marcus music".
+    static juce::String projectFolder (const juce::String& projectId);
 
     // Default cache directory. Precedence:
     //   1. ONORAB_CACHE_DIR environment variable (used by tests / CI);

@@ -41,8 +41,11 @@ curl http://127.0.0.1:18741/downloads/mock_voice_memo -o voice-memo.wav
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET | `/health` | `{"ok": true, "status": "ok", "provider": "mock", "version": "0.1.0"}` |
-| GET | `/files` | Bare array of `OnorabFile` (see `packages/protocol/file.json`) |
-| POST | `/uploads` | `multipart/form-data`, field `file`; returns the created file, HTTP 201 |
+| GET | `/files` | Bare array of `OnorabFile` in **creation order** (see `packages/protocol/file.json`); never alphabetical |
+| POST | `/uploads` | `multipart/form-data`, field `file` plus optional text field `project` (project name, stored as `projectId`; maps to Drive folder `Onorab_projet/<project>/` in Phase 2); returns the created file, HTTP 201 |
+| DELETE | `/files/{fileId}` | Deletes the file + its cache bytes; 404 for unknown ids |
+| POST | `/files/{fileId}/delete` | Same delete, for the JUCE plugin (no proven DELETE verb in JUCE URL) |
+| GET/POST | `/invites` | Project invites (`packages/protocol/invite.json`); POST body `{"email","project"}`, HTTP 201; Mock records only |
 | GET | `/downloads/{fileId}` | Raw audio bytes |
 | GET | `/transfers` | Bare array of `OnorabTransfer`, progress 0–100 |
 | WebSocket | `/events` | JSON `OnorabEvent` text frames (`hub.connected`, `transfer.*`, `file.added`) |

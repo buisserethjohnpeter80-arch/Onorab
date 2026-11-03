@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +25,19 @@ type OnorabFile struct {
 	ModifiedTime string  `json:"modifiedTime"`
 	ProjectID    *string `json:"projectId"`
 	Source       string  `json:"source"`
+}
+
+// OnorabInvite mirrors packages/protocol/invite.json. Phase 2 status:
+// in the Mock provider an invite is a local record only (Hub restarts
+// forget it). The real Drive provider turns an invite into a Drive
+// sharing permission (permissions.create) for that Gmail on the folder
+// Onorab_projet/<project>/ — the invited user then sees the same
+// project, in the same creation order, from their own FL Studio.
+type OnorabInvite struct {
+	Email     string `json:"email"`
+	Project   string `json:"project"`
+	Status    string `json:"status"` // pending | accepted (Phase 2)
+	CreatedAt string `json:"createdAt"`
 }
 
 // OnorabTransfer mirrors packages/protocol/transfer.json.
@@ -95,11 +107,18 @@ func (t *OnorabTransfer) transition(to string) error {
 
 // Store is the Hub's in-memory index plus its on-disk cache. The cache
 // holds audio bytes only — never tokens, credentials, or project state.
+// fileOrder is the creation order of files (seed order first, then
+// uploads in upload order). listFiles returns files in fileOrder,
+// NEVER sorted alphabetically: the Cloud Library and Projects lists
+// must show sounds in the order the project was created, so an invited
+// user's upload appears at the end, in order, not re-sorted.
 type Store struct {
 	mu        sync.Mutex
 	files     map[string]OnorabFile
+	fileOrder []string // file insertion order (creation order)
 	transfers map[string]*OnorabTransfer
 	order     []string // transfer insertion order
+	invites   []OnorabInvite
 	cacheDir  string
 	events    *EventHub
 }
@@ -141,18 +160,56 @@ func (s *Store) seedMockFiles() {
 		{ID: "mock_fl_capture", Name: "fl-capture-demo.wav", MimeType: "audio/wav", SizeBytes: int64(len(generateToneWAV(330, 1))), ModifiedTime: now, ProjectID: nil, Source: "hub"},
 	} {
 		s.files[f.ID] = f
+		s.fileOrder = append(s.fileOrder, f.ID)
 	}
 }
 
 func (s *Store) listFiles() []OnorabFile {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]OnorabFile, 0, len(s.files))
-	for _, f := range s.files {
-		out = append(out, f)
+	out := make([]OnorabFile, 0, len(s.fileOrder))
+	for _, id := range s.fileOrder {
+		if f, ok := s.files[id]; ok {
+			out = append(out, f)
+		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+// deleteFile removes a file from the index and its cached bytes (for
+// uploaded files; mock seeded files have no cached bytes, so only the
+// index entry goes — and a Hub restart re-seeds them, which is a Mock
+// limitation, not a Drive behaviour). It returns the deleted file.
+func (s *Store) deleteFile(id string) (OnorabFile, bool) {
+	s.mu.Lock()
+	file, ok := s.files[id]
+	if !ok {
+		s.mu.Unlock()
+		return OnorabFile{}, false
+	}
+	delete(s.files, id)
+	kept := s.fileOrder[:0]
+	for _, other := range s.fileOrder {
+		if other != id {
+			kept = append(kept, other)
+		}
+	}
+	s.fileOrder = kept
+	cacheDir := s.cacheDir
+	events := s.events
+	s.mu.Unlock()
+
+	// Cached bytes for uploads are stored as <id>_<name> (see
+	// handleUpload); remove every cache entry with that prefix.
+	if entries, err := os.ReadDir(cacheDir); err == nil {
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), id+"_") {
+				_ = os.Remove(filepath.Join(cacheDir, e.Name()))
+			}
+		}
+	}
+	events.Broadcast(OnorabEvent{Type: "file.deleted", Timestamp: nowISO(), File: &file})
+	return file, true
 }
 
 func (s *Store) listTransfers() []OnorabTransfer {
@@ -214,6 +271,8 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/files", s.handleFiles)
+	mux.HandleFunc("/files/", s.handleDeleteFile)
+	mux.HandleFunc("/invites", s.handleInvites)
 	mux.HandleFunc("/uploads", s.handleUpload)
 	mux.HandleFunc("/downloads/", s.handleDownload)
 	mux.HandleFunc("/transfers", s.handleTransfers)
@@ -230,7 +289,7 @@ func (s *Server) Handler() http.Handler {
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -258,6 +317,71 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.store.listFiles())
 }
 
+// handleDeleteFile deletes one file by id. It accepts DELETE
+// /files/{id} (for API clients) and POST /files/{id}/delete (for the
+// JUCE plugin, whose URL client has no proven DELETE verb — the POST
+// form is the one the plugin actually uses). The deleted file's local
+// cache copy is removed by Store.deleteFile; the plugin additionally
+// deletes its own cache copy on success. Unknown ids are 404, never a
+// silent success.
+func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/files/")
+	isPostDelete := r.Method == http.MethodPost && strings.HasSuffix(path, "/delete")
+	if r.Method != http.MethodDelete && !isPostDelete {
+		writeError(w, http.StatusMethodNotAllowed, "invalid_request", "method %s not allowed on /files/{id}", r.Method)
+		return
+	}
+	id := strings.TrimSuffix(path, "/delete")
+	if id == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusBadRequest, "invalid_request", "a file id is required in /files/{id}")
+		return
+	}
+	file, ok := s.store.deleteFile(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "no file with id %q", id)
+		return
+	}
+	writeJSON(w, http.StatusOK, file)
+}
+
+// handleInvites stores and lists project invites (Mock only, see
+// OnorabInvite). POST body: {"email": "...", "project": "..."}.
+// Email must contain '@'; project is sanitised like an upload project.
+func (s *Server) handleInvites(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.store.mu.Lock()
+		out := append([]OnorabInvite(nil), s.store.invites...)
+		s.store.mu.Unlock()
+		if out == nil {
+			out = []OnorabInvite{}
+		}
+		writeJSON(w, http.StatusOK, out)
+	case http.MethodPost:
+		var body struct {
+			Email   string `json:"email"`
+			Project string `json:"project"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_invite", "invite body must be JSON: %v", err)
+			return
+		}
+		email := strings.TrimSpace(body.Email)
+		project := sanitiseProjectName(body.Project)
+		if !strings.Contains(email, "@") || project == "" {
+			writeError(w, http.StatusBadRequest, "invalid_invite", "invite needs an email containing '@' and a project name")
+			return
+		}
+		invite := OnorabInvite{Email: email, Project: project, Status: "pending", CreatedAt: nowISO()}
+		s.store.mu.Lock()
+		s.store.invites = append(s.store.invites, invite)
+		s.store.mu.Unlock()
+		writeJSON(w, http.StatusCreated, invite)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "invalid_request", "method %s not allowed on /invites", r.Method)
+	}
+}
+
 func (s *Server) handleTransfers(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "invalid_request", "method %s not allowed on /transfers", r.Method)
@@ -274,11 +398,49 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// Project folder model (user decision, 2026-11-03; Phase 2 spec, Mock
+// implementation here): every Onorab file belongs to a project, and on
+// real Drive a project lives under the single dedicated folder
+// "Onorab_projet/<project>/" — created on the FIRST upload if it does
+// not exist, then reused, never recreated per upload, and no other Drive
+// folder is ever touched. In the Mock provider the project is carried
+// as the file's ProjectID (the protocol's existing projectId field);
+// the real Drive provider must translate that same ProjectID into the
+// Onorab_projet/<project>/ folder path. A project name is a plain
+// display name (e.g. "marcus music"), never a path: separators are
+// stripped by sanitiseProjectName so "../" tricks cannot escape the
+// dedicated folder.
+func sanitiseProjectName(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "/", "-")
+	s = strings.ReplaceAll(s, "\\", "-")
+	s = strings.TrimSpace(s)
+	if s == "." || s == ".." {
+		return ""
+	}
+	if len(s) > 100 {
+		s = s[:100]
+	}
+	return s
+}
+
+// driveFolderFor returns the Drive folder path for a project, for
+// documentation and for the future real Drive provider. The Mock
+// provider stores only the ProjectID; it does not create directories.
+func driveFolderFor(project string) string {
+	if project == "" {
+		return "Onorab_projet"
+	}
+	return "Onorab_projet/" + project
+}
+
 // handleUpload accepts multipart/form-data with a single field named
-// "file" (the contract used by both the VST3 plugin and the mobile app).
-// It stores the bytes in the local cache, indexes the file, and records
-// a completed upload transfer. Errors are returned as JSON, never as a
-// silent 200 with no file.
+// "file" (the contract used by both the VST3 plugin and the mobile app),
+// plus an optional text field named "project" carrying the project
+// name (see the project folder model above). It stores the bytes in
+// the local cache, indexes the file, and records a completed upload
+// transfer. Errors are returned as JSON, never as a silent 200 with
+// no file.
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "invalid_request", "method %s not allowed on /uploads", r.Method)
@@ -326,9 +488,14 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if mime == "" {
 		mime = "audio/wav"
 	}
-	file := OnorabFile{ID: id, Name: name, MimeType: mime, SizeBytes: size, ModifiedTime: nowISO(), ProjectID: nil, Source: "phone"}
+	var projectID *string
+	if p := sanitiseProjectName(r.FormValue("project")); p != "" {
+		projectID = &p
+	}
+	file := OnorabFile{ID: id, Name: name, MimeType: mime, SizeBytes: size, ModifiedTime: nowISO(), ProjectID: projectID, Source: "phone"}
 	s.store.mu.Lock()
 	s.store.files[id] = file
+	s.store.fileOrder = append(s.store.fileOrder, id)
 	s.store.mu.Unlock()
 	s.store.finishTransfer(transfer, nil)
 	s.store.events.Broadcast(OnorabEvent{Type: "file.added", Timestamp: nowISO(), File: &file})

@@ -276,7 +276,15 @@ void HubClient::downloadFile (const CloudFile& file, const juce::File& cacheDir,
     });
 }
 
-void HubClient::uploadFile (const juce::File& file, UploadCallback cb, ProgressCallback progress)
+juce::String HubClient::projectFolder (const juce::String& projectId)
+{
+    if (projectId.trim().isEmpty())
+        return "Onorab_projet";
+    return "Onorab_projet/" + projectId.trim();
+}
+
+void HubClient::uploadFile (const juce::File& file, UploadCallback cb, ProgressCallback progress,
+                            const juce::String& project)
 {
     const juce::String url = baseUrl + "/uploads";
     auto token = aliveToken;
@@ -301,6 +309,15 @@ void HubClient::uploadFile (const juce::File& file, UploadCallback cb, ProgressC
             {
                 body.append (s.toRawUTF8(), s.getNumBytesAsUTF8());
             };
+            // Optional project field (must come before the file part in
+            // this hand-built body). The Hub sanitises it; an empty
+            // project means "no project yet", never a folder escape.
+            if (project.trim().isNotEmpty())
+            {
+                appendText ("--" + boundary + "\r\n");
+                appendText ("Content-Disposition: form-data; name=\"project\"\r\n\r\n");
+                appendText (project.trim() + "\r\n");
+            }
             appendText ("--" + boundary + "\r\n");
             appendText ("Content-Disposition: form-data; name=\"file\"; filename=\""
                         + file.getFileName() + "\"\r\n");
@@ -365,6 +382,113 @@ void HubClient::uploadFile (const juce::File& file, UploadCallback cb, ProgressC
     });
 }
 
+// Small POST helper for the auth/delete/invite endpoints: POSTs the
+// given body, then reports ok unless the Hub answered with an error
+// envelope. Background thread; the callback hops to the message thread.
+static void postToHub (juce::String url, const juce::String& bodyText,
+                       const juce::String& contentType,
+                       HubClient::AliveToken token,
+                       std::function<void (bool, juce::String)> done)
+{
+    juce::MemoryBlock body;
+    body.append (bodyText.toRawUTF8(), bodyText.getNumBytesAsUTF8());
+    juce::URL request = juce::URL (url).withPOSTData (body);
+    auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
+                       .withConnectionTimeoutMs (kTimeoutMs);
+    if (contentType.isNotEmpty())
+        options = options.withExtraHeaders ("Content-Type: " + contentType);
+    std::unique_ptr<juce::InputStream> stream (request.createInputStream (options));
+    bool ok = false;
+    juce::String error;
+    if (stream == nullptr)
+    {
+        error = "Could not reach the Hub — is Onorab Hub running?";
+    }
+    else
+    {
+        const juce::String response = stream->readEntireStreamAsString();
+        if (response.containsIgnoreCase ("\"error\""))
+            error = response.substring (0, 300);
+        else
+            ok = true;
+    }
+    juce::MessageManager::callAsync ([done = std::move (done), token, ok, error]() mutable
+    {
+        if (token != nullptr && ! token->load())
+            return;
+        done (ok, error);
+    });
+}
+
+void HubClient::deleteFile (const CloudFile& file, DeleteCallback cb)
+{
+    const juce::String url = baseUrl + "/files/" + file.id + "/delete";
+    auto token = aliveToken;
+    runInBackground ([url, cb = std::move (cb), token]() mutable
+    {
+        postToHub (url, "delete", {}, token, [cb = std::move (cb)] (bool ok, juce::String error) mutable
+        {
+            cb (ok, error);
+        });
+    });
+}
+
+void HubClient::getAuthStatus (AuthCallback cb)
+{
+    const juce::String url = baseUrl + "/auth/status";
+    auto token = aliveToken;
+    runInBackground ([url, cb = std::move (cb), token]() mutable
+    {
+        juce::String text, error;
+        bool ok = httpGetText (url, text, error);
+        juce::String detail;
+        if (ok)
+        {
+            const juce::var parsed = juce::JSON::parse (text);
+            detail = "provider: " + getStringField (parsed, "provider")
+                   + ", authenticated: " + getStringField (parsed, "authenticated");
+        }
+        juce::MessageManager::callAsync ([cb = std::move (cb), token, ok, error, detail]() mutable
+        {
+            if (token != nullptr && ! token->load())
+                return;
+            cb (ok, error, detail);
+        });
+    });
+}
+
+void HubClient::startAuth (AuthCallback cb)
+{
+    const juce::String url = baseUrl + "/auth/start";
+    auto token = aliveToken;
+    runInBackground ([url, cb = std::move (cb), token]() mutable
+    {
+        // postToHub already hops to the message thread before calling
+        // done, so the Auth callback runs there directly (no second hop).
+        postToHub (url, "start", {}, token, [cb = std::move (cb)] (bool ok, juce::String error) mutable
+        {
+            cb (ok, error, {});
+        });
+    });
+}
+
+void HubClient::sendInvite (const juce::String& email, const juce::String& project, InviteCallback cb)
+{
+    const juce::String url = baseUrl + "/invites";
+    auto token = aliveToken;
+    runInBackground ([url, email, project, cb = std::move (cb), token]() mutable
+    {
+        juce::DynamicObject::Ptr obj = new juce::DynamicObject();
+        obj->setProperty ("email", email);
+        obj->setProperty ("project", project);
+        const juce::String body = juce::JSON::toString (juce::var (obj.get()));
+        postToHub (url, body, "application/json", token, [cb = std::move (cb)] (bool ok, juce::String error) mutable
+        {
+            cb (ok, error);
+        });
+    });
+}
+
 std::vector<CloudFile> HubClient::parseFiles (const juce::String& jsonText)
 {
     std::vector<CloudFile> out;
@@ -379,6 +503,7 @@ std::vector<CloudFile> HubClient::parseFiles (const juce::String& jsonText)
             f.sizeBytes = getIntField (item, "sizeBytes", "size");
             f.updatedAt = getStringField (item, "updatedAt");
             f.mimeType = getStringField (item, "mimeType");
+            f.projectId = getStringField (item, "projectId");
             if (f.id.isNotEmpty() && f.name.isNotEmpty())
                 out.push_back (std::move (f));
             else

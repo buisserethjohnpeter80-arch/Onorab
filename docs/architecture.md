@@ -111,6 +111,90 @@ Rules:
   the `drive.file` scope only (see `security.md`). The provider boundary
   means swapping Mock for Drive does not change the plugin or the API.
 
+### 3.3a Project folder model (user decision, 2026-11-03)
+
+- On Drive there is exactly ONE dedicated Onorab folder tree:
+  `Onorab_projet/<project>/`, e.g. `Onorab_projet/marcus music/`.
+  It is created on the FIRST upload if it does not exist, then reused;
+  it is never recreated per upload, and no other Drive folder is ever
+  touched. (With `drive.file` scope the app can in any case only see
+  files it created or the user explicitly opened with it.)
+- A file's project is the protocol's existing `projectId` field — a
+  plain display name, never a path. The Hub sanitises it (`/` and `\`
+  become `-`, `.`/`..` rejected) so a project name can never escape
+  the dedicated folder. In the Mock provider the project is stored as
+  `projectId`; the real Drive provider translates the same value into
+  the `Onorab_projet/<project>/` folder path.
+- Plugin flows built on this model (no separate Download button):
+  **Take from Drive** downloads selected Library sounds to the local
+  cache in one step, ready to preview and drag into FL Studio.
+  **Upload one / Upload all** pick local files into a typed project.
+  **Push** uploads the LOCAL copies of selected project sounds into
+  `Onorab_projet/<project>/`; a sound with no local copy is skipped
+  with a visible message (Take it first). Play/Pause preview always
+  stays available before a sound enters FL Studio.
+- Honest limit, stated in the UI: FL Studio cannot list its own
+  project tracks automatically — a VST sees only its own Mixer Track
+  audio, not the whole FL project. Local sounds enter a project only
+  via Upload or Push, never by silent auto-discovery.
+
+### 3.3b Onorab Bus routing (user logic, 2026-11-03)
+
+- A VST cannot create an FL Mixer track or route FL tracks — FL Studio
+  owns its Mixer, and no VST API exposes track creation or routing.
+  The Onorab Bus is therefore a USER workflow in FL Studio, supported
+  (not performed) by the plugin:
+  1. In the FL Mixer, pick an empty track, name it `Onorab`, and load
+     the Onorab plugin on it. This track is used ONLY for Onorab.
+  2. Select the track(s) to capture and route them to the Onorab
+     track with **Route to this track only** (so the track is heard
+     once, through the bus to Master, not twice via Master + bus).
+  3. For track-by-track capture: route ONE track, type its name in
+     the plugin's capture name box (e.g. `Vocal`), press
+     **Capture from FL**, then **Stop capture**. The file is named
+     `<name>-<timestamp>.wav`, so it stays identifiable when uploaded
+     or pushed to a project.
+  4. For a mix capture: route ALL wanted tracks to the bus at once
+     and capture with no name (auto `capture-<timestamp>.wav`).
+  5. After capturing, remove the route so the track returns to its
+     normal Master routing.
+- The plugin's part of this logic is only: capture whatever audio
+  arrives on its own track (unchanged pass-through), name the capture
+  after the typed track name, and offer Upload / Push into
+  `Onorab_projet/<project>/`. It never claims to have routed anything
+  itself.
+
+### 3.3c Delete, creation order, Drive connect, invites (2026-11-03)
+
+- **Delete:** the Library and Projects tabs have a **Delete** button.
+  It deletes the selected sound(s) from the Hub (Drive) via
+  `POST /files/{id}/delete` (DELETE `/files/{id}` also works for API
+  clients) and, only on Hub success, their local cache copies too.
+  Unknown ids are 404, never silent success. Mock limitation: a Hub
+  restart re-seeds the 3 mock files, so deleting a mock file is not
+  permanent until the real Drive provider exists.
+- **Creation order (not alphabetical):** `GET /files` returns files in
+  creation order — seed order first, then uploads in upload order.
+  The plugin never re-sorts; Library and Projects filters preserve
+  Hub order. An invited user uploading from another FL Studio therefore
+  appears at the end of the project list, in order, instead of jumping
+  into alphabetical position. (Previously the Hub sorted by name;
+  that ordering is removed.)
+- **Settings → Google Drive:** the user enters a Gmail and presses
+  **Connect Drive**. The plugin asks the Hub (`GET /auth/status`,
+  then `POST /auth/start`). In Mock mode this honestly reports
+  `oauth_unavailable` — no fake login, nothing sent to Google. With
+  the real Drive provider, the same button starts real OAuth (PKCE,
+  `drive.file` only, tokens in the OS keychain, never in FL projects).
+- **Settings → Invite to a project:** the user enters an invited
+  Gmail and a project name and presses **Invite**. The Hub records a
+  pending invite (`GET/POST /invites`, schema
+  `packages/protocol/invite.json`; Mock records are forgotten on Hub
+  restart). The real Drive provider turns a pending invite into a
+  Drive sharing permission for that Gmail on
+  `Onorab_projet/<project>/`, so the invited user sees the same
+  project, in the same creation order, from their own FL Studio.
+
 ### 3.4 Mobile <-> Drive
 
 - Phase 1: the mobile app runs in **mock mode** with local mock data. It
