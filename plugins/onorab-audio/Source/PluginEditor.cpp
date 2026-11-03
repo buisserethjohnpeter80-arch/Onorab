@@ -538,8 +538,9 @@ OnorabAudioProcessorEditor::OnorabAudioProcessorEditor (OnorabAudioProcessor& pr
     settingsTab->setValues (audioProcessor.getHubUrl(),
                             audioProcessor.getCacheDir().getFullPathName());
 
-    dragContainer.addAndMakeVisible (&tabbedComponent);
-    addAndMakeVisible (&dragContainer);
+    // The editor itself IS the DragAndDropContainer (see header), so the
+    // tabbed component is added directly to the editor.
+    addAndMakeVisible (tabbedComponent);
 
     refreshFiles();
     checkHealth();
@@ -570,8 +571,7 @@ void OnorabAudioProcessorEditor::paint (juce::Graphics& g)
 
 void OnorabAudioProcessorEditor::resized()
 {
-    dragContainer.setBounds (getLocalBounds());
-    tabbedComponent.setBounds (dragContainer.getLocalBounds());
+    tabbedComponent.setBounds (getLocalBounds());
 }
 
 bool OnorabAudioProcessorEditor::isInterestedInFileDrag (const juce::StringArray& files)

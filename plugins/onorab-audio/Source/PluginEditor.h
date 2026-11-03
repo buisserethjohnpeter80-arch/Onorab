@@ -161,6 +161,7 @@ private:
 // ---- The editor itself ----
 
 class OnorabAudioProcessorEditor : public juce::AudioProcessorEditor,
+                                   public juce::DragAndDropContainer,
                                    private juce::Timer,
                                    public juce::FileDragAndDropTarget
 {
@@ -232,7 +233,11 @@ private:
     TransfersTab* transfersTab = nullptr;
     SettingsTab* settingsTab = nullptr;
     juce::TabbedComponent tabbedComponent { juce::TabbedButtonBar::TabsAtTop };
-    juce::DragAndDropContainer dragContainer;
+    // NOTE (JUCE 8 fix, 2026-11-03): DragAndDropContainer is NOT a
+    // Component in JUCE 8, so it must be a BASE CLASS of the editor,
+    // not a member — a member cannot host children (no addAndMakeVisible
+    // / setBounds) and findParentComponentOfClass<DragAndDropContainer>
+    // would never find it. The editor itself is the container.
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (OnorabAudioProcessorEditor)
 };
