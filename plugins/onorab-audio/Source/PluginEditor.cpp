@@ -26,7 +26,7 @@ void styleButton (juce::TextButton& button, juce::Colour accent = kCyan)
 void styleLabel (juce::Label& label, juce::Colour colour = juce::Colours::white, float size = 13.0f)
 {
     label.setColour (juce::Label::textColourId, colour);
-    label.setFont (juce::Font (size));
+    label.setFont (juce::Font (juce::FontOptions (size)));
     label.setJustificationType (juce::Justification::left);
 }
 
@@ -399,7 +399,7 @@ ProjectsTab::ProjectsTab (OnorabAudioProcessorEditor& editorIn)
                        "through Upload or Push below.",
                        juce::NotificationType::dontSendNotification);
     infoLabel.setColour (juce::Label::textColourId, juce::Colours::white);
-    infoLabel.setFont (juce::Font (13.0f));
+    infoLabel.setFont (juce::Font (juce::FontOptions (13.0f)));
     infoLabel.setJustificationType (juce::Justification::topLeft);
     addAndMakeVisible (infoLabel);
 
@@ -671,7 +671,7 @@ SettingsTab::SettingsTab (OnorabAudioProcessorEditor& editorIn)
                        "Mock Drive mode is a Hub-side setting.",
                        juce::NotificationType::dontSendNotification);
     noteLabel.setColour (juce::Label::textColourId, juce::Colours::lightgrey);
-    noteLabel.setFont (juce::Font (12.0f));
+    noteLabel.setFont (juce::Font (juce::FontOptions (12.0f)));
     noteLabel.setJustificationType (juce::Justification::topLeft);
     addAndMakeVisible (noteLabel);
 

@@ -202,13 +202,14 @@ private:
     juce::TextButton saveButton { "Save" };
     juce::TextButton browseButton { "Browse…" };
     std::unique_ptr<juce::FileChooser> dirChooser;
-    // Google Drive connect (Hub-side; real Google sign-in is Phase 2).
+    // Google Drive connect (Hub-side PKCE flow; see drive_oauth.go).
     juce::Label driveLabel;
     juce::TextEditor driveEmailBox;
     juce::TextButton connectDriveButton { "Connect Drive" };
     juce::Label driveStatusLabel;
-    // Invite another user to a project (Hub-side record; real Drive
-    // sharing of Onorab_projet/<project>/ is Phase 2).
+    // Invite another user to a project (Hub-side; in Drive mode the
+    // Hub creates a real Drive writer permission on
+    // Onorab_projet/<project>/).
     juce::Label inviteLabel;
     juce::TextEditor inviteEmailBox, inviteProjectBox;
     juce::TextButton inviteButton { "Invite" };
@@ -253,8 +254,8 @@ public:
     // Hub delete keeps the recoverable local file). Permanent on the
     // Hub side — in Mock mode a Hub restart re-seeds the 3 mock files.
     void deleteHubFiles (const std::vector<CloudFile>& files);
-    // Settings: Drive connect + project invite (Hub-side, Phase 2 for
-    // real Google sign-in / Drive sharing; see SettingsTab notes).
+    // Settings: Drive connect + project invite (Hub-side OAuth +
+    // Drive sharing; see SettingsTab notes).
     void connectDrive (const juce::String& email);
     void inviteToProject (const juce::String& email, const juce::String& project);
     void uploadLastCapture();

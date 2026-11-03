@@ -402,11 +402,14 @@ static void postToHub (juce::String url, const juce::String& bodyText,
     // variant is a separate createInputStream call, not `options =`.
     const auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
                              .withConnectionTimeoutMs (kTimeoutMs);
+    // createInputStream returns a unique_ptr in JUCE 8: move-assign it
+    // into stream. reset() takes a RAW pointer, so reset(unique_ptr)
+    // is MSVC C2664 (cannot convert unique_ptr to InputStream*).
     std::unique_ptr<juce::InputStream> stream;
     if (contentType.isNotEmpty())
-        stream.reset (request.createInputStream (options.withExtraHeaders ("Content-Type: " + contentType)));
+        stream = request.createInputStream (options.withExtraHeaders ("Content-Type: " + contentType));
     else
-        stream.reset (request.createInputStream (options));
+        stream = request.createInputStream (options);
     bool ok = false;
     juce::String error;
     if (stream == nullptr)
