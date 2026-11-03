@@ -320,11 +320,16 @@ void HubClient::uploadFile (const juce::File& file, UploadCallback cb, ProgressC
                 if (progress != nullptr)
                     progress (0.5); // Upload progress is coarse: sent / done.
 
-                juce::URL request (url);
+                // NOTE (JUCE 8 fix, 2026-11-03): withPOSTData() lives on
+                // juce::URL, NOT on URL::InputStreamOptions — the earlier
+                // chain failed CI with C2039. URL is immutable, so
+                // withPOSTData() returns a NEW url; assigning it back is
+                // required, otherwise the POST body is silently dropped.
+                // With POST data set, createInputStream() does a POST.
+                juce::URL request = juce::URL (url).withPOSTData (body);
                 auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
                                    .withConnectionTimeoutMs (kTimeoutMs)
-                                   .withExtraHeaders ("Content-Type: multipart/form-data; boundary=" + boundary)
-                                   .withPOSTData (body);
+                                   .withExtraHeaders ("Content-Type: multipart/form-data; boundary=" + boundary);
                 std::unique_ptr<juce::InputStream> stream (request.createInputStream (options));
                 if (stream == nullptr)
                 {
