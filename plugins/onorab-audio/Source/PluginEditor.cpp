@@ -272,9 +272,16 @@ void LibraryTab::setTakenLocalFiles (const juce::StringArray& files)
 std::vector<CloudFile> LibraryTab::getSelectedFiles() const
 {
     std::vector<CloudFile> out;
-    for (const auto row : fileList.getSelectedRows())
+    // juce::SparseSet has no begin()/end() iterators, so a range-for
+    // over getSelectedRows() does not compile (MSVC C3312). Index it:
+    // rows[i] is the i-th selected row, rows.size() the count.
+    const juce::SparseSet<int> rows = fileList.getSelectedRows();
+    for (int i = 0; i < rows.size(); ++i)
+    {
+        const int row = rows[i];
         if (row >= 0 && row < static_cast<int> (filteredFiles.size()))
             out.push_back (filteredFiles[static_cast<size_t> (row)]);
+    }
     return out;
 }
 
@@ -494,9 +501,14 @@ juce::String ProjectsTab::getProjectName() const
 std::vector<CloudFile> ProjectsTab::getSelectedFiles() const
 {
     std::vector<CloudFile> out;
-    for (const auto row : fileList.getSelectedRows())
+    // Same SparseSet note as LibraryTab: no iterators, index it.
+    const juce::SparseSet<int> rows = fileList.getSelectedRows();
+    for (int i = 0; i < rows.size(); ++i)
+    {
+        const int row = rows[i];
         if (row >= 0 && row < static_cast<int> (filteredFiles.size()))
             out.push_back (filteredFiles[static_cast<size_t> (row)]);
+    }
     return out;
 }
 

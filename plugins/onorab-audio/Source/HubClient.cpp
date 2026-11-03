@@ -288,7 +288,10 @@ void HubClient::uploadFile (const juce::File& file, UploadCallback cb, ProgressC
 {
     const juce::String url = baseUrl + "/uploads";
     auto token = aliveToken;
-    runInBackground ([url, file, cb = std::move (cb), progress = std::move (progress), token]() mutable
+    // NOTE: `project` must be captured here — the upload body sends it
+    // as the multipart "project" field. Omitting it was MSVC C2326
+    // (lambda cannot access 'project', no default capture mode).
+    runInBackground ([url, file, project, cb = std::move (cb), progress = std::move (progress), token]() mutable
     {
         bool ok = false;
         juce::String error;
