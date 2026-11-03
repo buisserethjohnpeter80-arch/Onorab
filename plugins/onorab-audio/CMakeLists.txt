@@ -47,6 +47,8 @@ juce_add_plugin(Onorab
     VST3_CATEGORIES "Fx"
 )
 
+juce_generate_juce_header(Onorab)
+
 target_sources(Onorab
     PRIVATE
         Source/PluginProcessor.cpp

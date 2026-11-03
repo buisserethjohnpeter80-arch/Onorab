@@ -6,7 +6,7 @@ import type { CapacitorConfig } from '@capacitor/cli';
 const config: CapacitorConfig = {
   appId: 'com.potoriktrack.onorab',
   appName: 'Onorab',
-  webDir: 'www',
+  webDir: 'www/browser',
   // Keep the bundled web app navigable only to itself in Phase 1.
   server: {
     androidScheme: 'https',
