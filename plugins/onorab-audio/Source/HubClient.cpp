@@ -396,11 +396,17 @@ static void postToHub (juce::String url, const juce::String& bodyText,
     juce::MemoryBlock body;
     body.append (bodyText.toRawUTF8(), bodyText.getNumBytesAsUTF8());
     juce::URL request = juce::URL (url).withPOSTData (body);
-    auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
-                       .withConnectionTimeoutMs (kTimeoutMs);
+    // NOTE: juce::URL::InputStreamOptions has a DELETED assignment
+    // operator in JUCE 8 (MSVC C2280) — it can be built by chaining
+    // (initialization) but never reassigned. So the Content-Type
+    // variant is a separate createInputStream call, not `options =`.
+    const auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
+                             .withConnectionTimeoutMs (kTimeoutMs);
+    std::unique_ptr<juce::InputStream> stream;
     if (contentType.isNotEmpty())
-        options = options.withExtraHeaders ("Content-Type: " + contentType);
-    std::unique_ptr<juce::InputStream> stream (request.createInputStream (options));
+        stream.reset (request.createInputStream (options.withExtraHeaders ("Content-Type: " + contentType)));
+    else
+        stream.reset (request.createInputStream (options));
     bool ok = false;
     juce::String error;
     if (stream == nullptr)
