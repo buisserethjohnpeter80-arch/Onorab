@@ -55,6 +55,13 @@ func (g *OAuthGuard) InProgress() bool {
 	return g.inProgress
 }
 
+// pkceChallenge derives the S256 challenge for a verifier, per RFC
+// 7636. Kept separate so tests can check it against the RFC vector.
+func pkceChallenge(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
 // pkcePair generates a PKCE code verifier and its S256 challenge, per
 // RFC 7636. The verifier is never logged and never sent to the plugin.
 func pkcePair() (verifier, challenge string, err error) {
@@ -63,11 +70,16 @@ func pkcePair() (verifier, challenge string, err error) {
 		return "", "", err
 	}
 	verifier = base64.RawURLEncoding.EncodeToString(b)
-	sum := sha256.Sum256([]byte(verifier))
-	challenge = base64.RawURLEncoding.EncodeToString(sum[:])
-	return verifier, challenge, nil
+	return verifier, pkceChallenge(verifier), nil
 }
 
+// handleAuthStart starts a Google sign-in and returns the auth URL
+// for the plugin to open in the user's browser. The Hub never receives
+// a password: the user signs in on Google's own page, Google redirects
+// to the Hub's loopback listener, and the Hub exchanges the code for
+// tokens it stores in the OS keychain. In Mock mode there is no real
+// OAuth, so it reports oauth_unavailable honestly instead of faking
+// a login.
 func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "invalid_request", "method %s not allowed on /auth/start", r.Method)
@@ -77,12 +89,32 @@ func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "oauth_in_progress", "an OAuth session is already in progress; wait for it to finish before starting another")
 		return
 	}
-	// Phase 1 has no real OAuth session to run: release immediately and
-	// report clearly, instead of pretending a login happened.
-	s.oauth.Finish()
-	writeError(w, http.StatusNotImplemented, "oauth_unavailable",
-		"Google OAuth is not available in Phase 1 (Mock Drive Provider). "+
-			"Phase 2 adds OAuth 2.0 with PKCE, drive.file scope only, with tokens in the OS keychain.")
+	if s.driveAuth == nil {
+		s.oauth.Finish()
+		writeError(w, http.StatusNotImplemented, "oauth_unavailable",
+			"Google OAuth is not available in Mock mode. "+
+				"Start the Hub with ONORAB_DRIVE_PROVIDER=drive to use real Drive sign-in.")
+		return
+	}
+	authURL, done, err := s.driveAuth.startBrowserSession()
+	if err != nil {
+		s.oauth.Finish()
+		writeError(w, http.StatusInternalServerError, "internal", "could not start Google sign-in: %v", err)
+		return
+	}
+	// The session ends asynchronously (browser callback or timeout);
+	// release the single-flight guard exactly once, then.
+	go func() {
+		err := <-done
+		s.oauth.Finish()
+		if err == nil {
+			s.store.events.Broadcast(OnorabEvent{Type: "auth.connected", Timestamp: nowISO()})
+		}
+	}()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "awaiting_user", "auth_url": authURL,
+		"note": "Open this URL in a browser, sign in with your Gmail, and approve drive.file access. Then press Refresh in the plugin.",
+	})
 }
 
 // TokenStore is the Phase 2 storage boundary. Phase 1 has no tokens, so

@@ -457,17 +457,54 @@ void HubClient::getAuthStatus (AuthCallback cb)
     });
 }
 
+// POST helper that returns the response body, for endpoints whose
+// success payload matters (auth_url from /auth/start). Runs on the
+// calling (background) thread; the caller hops to the message thread.
+static bool postText (const juce::String& url, const juce::String& bodyText,
+                      juce::String& responseOut, juce::String& errorOut)
+{
+    juce::MemoryBlock body;
+    body.append (bodyText.toRawUTF8(), bodyText.getNumBytesAsUTF8());
+    juce::URL request = juce::URL (url).withPOSTData (body);
+    auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
+                       .withConnectionTimeoutMs (kTimeoutMs);
+    std::unique_ptr<juce::InputStream> stream (request.createInputStream (options));
+    if (stream == nullptr)
+    {
+        errorOut = "Could not reach the Hub — is Onorab Hub running?";
+        return false;
+    }
+    responseOut = stream->readEntireStreamAsString();
+    if (responseOut.containsIgnoreCase ("\"error\""))
+    {
+        errorOut = responseOut.substring (0, 300);
+        return false;
+    }
+    return true;
+}
+
 void HubClient::startAuth (AuthCallback cb)
 {
     const juce::String url = baseUrl + "/auth/start";
     auto token = aliveToken;
     runInBackground ([url, cb = std::move (cb), token]() mutable
     {
-        // postToHub already hops to the message thread before calling
-        // done, so the Auth callback runs there directly (no second hop).
-        postToHub (url, "start", {}, token, [cb = std::move (cb)] (bool ok, juce::String error) mutable
+        juce::String response, error;
+        const bool ok = postText (url, "start", response, error);
+        // Success detail is the auth URL: the editor opens it in the
+        // user's browser (Google's own sign-in page — the plugin never
+        // sees a password). Mock mode returns oauth_unavailable here.
+        juce::String authUrl;
+        if (ok)
         {
-            cb (ok, error, {});
+            const juce::var parsed = juce::JSON::parse (response);
+            authUrl = getStringField (parsed, "auth_url");
+        }
+        juce::MessageManager::callAsync ([cb = std::move (cb), token, ok, error, authUrl]() mutable
+        {
+            if (token != nullptr && ! token->load())
+                return;
+            cb (ok, error, authUrl);
         });
     });
 }

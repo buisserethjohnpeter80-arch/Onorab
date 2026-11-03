@@ -2,20 +2,21 @@
 // that sits between the Onorab VST3 plugin, the mobile app (via the host
 // loopback), and a drive provider.
 //
-// Phase 1 provider is "mock" only. It serves three seeded mock files and
-// generates real, playable WAV bytes for their downloads, and it stores
-// real uploaded files in the local cache directory. No Google credentials,
-// tokens, or network calls to Google exist in Phase 1.
+// Providers: "mock" (Phase 1 seeds, no Google) or "drive" (real Google
+// Drive, drive.file only, per-PC user sign-in — see drive_oauth.go and
+// docs/architecture.md §3.4 for the commercial multi-PC model).
 //
 // Security rules enforced here, not just documented:
 //   - The listener binds 127.0.0.1 only (never 0.0.0.0).
 //   - No token is ever written into an FL Studio project: the Hub holds
 //     no project state at all, and the plugin stores only Hub URL +
 //     cache directory in its state.
-//   - The Desktop OAuth credential JSON is never compiled in. It is only
-//     read, if present, from ONORAB_CREDENTIALS_PATH at runtime (Phase 2).
-//   - ONORAB_DRIVE_PROVIDER=drive fails fast at startup in Phase 1
-//     instead of silently falling back to mock data.
+//   - No OAuth client secret is compiled in. The release build injects
+//     only the client id via -X main.buildOAuthClientID (CI secret);
+//     a Desktop OAuth JSON at ONORAB_CREDENTIALS_PATH is dev-only.
+//   - An unknown provider fails fast instead of silently falling back
+//     to mock data, which would mislead the user into thinking real
+//     Drive sync was working.
 package main
 
 import (
@@ -61,11 +62,8 @@ func loadConfig() Config {
 
 func main() {
 	cfg := loadConfig()
-	if cfg.Provider != "mock" {
-		// Fail fast and loudly: a silent mock fallback would mislead the
-		// user into thinking real Drive sync was working.
-		log.Fatalf("onorab-hub: drive provider %q is not implemented in Phase 1; "+
-			"set ONORAB_DRIVE_PROVIDER=mock (default) until Phase 2 adds real Google Drive OAuth", cfg.Provider)
+	if cfg.Provider != "mock" && cfg.Provider != "drive" {
+		log.Fatalf("onorab-hub: unknown drive provider %q (use mock or drive)", cfg.Provider)
 	}
 	hub, err := NewServer(cfg)
 	if err != nil {

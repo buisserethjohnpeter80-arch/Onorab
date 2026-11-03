@@ -111,7 +111,10 @@ public:
     // plugin uses the POST form because JUCE's URL client has no proven
     // DELETE verb. Deleting the local cache copy is the editor's job.
     void deleteFile (const CloudFile& file, DeleteCallback cb);
-    // Drive auth (Hub-side; Phase 2 for real Google sign-in).
+    // Drive auth (Hub-side). getAuthStatus detail is
+    // "provider: <name>, authenticated: <0/1>". startAuth detail is
+    // the Google sign-in URL to open in the browser (empty in Mock
+    // mode, where it fails with oauth_unavailable instead).
     void getAuthStatus (AuthCallback cb);
     void startAuth (AuthCallback cb);
     // Project invite (Hub-side record; real Drive sharing is Phase 2).

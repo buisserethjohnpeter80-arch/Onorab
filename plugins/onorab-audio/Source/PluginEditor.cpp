@@ -666,11 +666,12 @@ SettingsTab::SettingsTab (OnorabAudioProcessorEditor& editorIn)
     styleLabel (statusLabel, kGreen);
     addAndMakeVisible (statusLabel);
 
-    // Google Drive connect. Honest Phase status: the Hub holds the
-    // OAuth flow, not this plugin, and the Hub is still in Mock mode,
-    // so Connect Drive today reports that real Google sign-in is not
-    // ready yet instead of faking a login. When the real Drive
-    // provider lands, the same button starts the real flow.
+    // Google Drive connect. The Hub holds the OAuth flow, not this
+    // plugin: Connect Drive asks the Hub for a Google sign-in URL and
+    // opens it in the browser. In Mock mode the Hub reports
+    // oauth_unavailable honestly instead of faking a login; in Drive
+    // mode it starts the real PKCE flow (drive.file only, token in
+    // Windows Credential Manager on this PC only).
     styleLabel (driveLabel);
     driveLabel.setText ("Google Drive", juce::NotificationType::dontSendNotification);
     addAndMakeVisible (driveLabel);
@@ -682,11 +683,12 @@ SettingsTab::SettingsTab (OnorabAudioProcessorEditor& editorIn)
     styleLabel (driveStatusLabel, juce::Colours::lightgrey, 12.0f);
     addAndMakeVisible (driveStatusLabel);
 
-    // Invite another user to a project. Today this records a pending
-    // invite on the Hub (GET/POST /invites); real Drive sharing of
-    // Onorab_projet/<project>/ with that Gmail is Phase 2, so the
-    // invited user cannot access the folder yet. The invite is
-    // recorded, not pretended to be delivered.
+    // Invite another user to a project. In Mock mode this records a
+    // pending invite on the Hub only. In Drive mode the Hub creates a
+    // real Drive writer permission on Onorab_projet/<project>/ for
+    // that Gmail. drive.file limitation, stated honestly in the
+    // status text: the invitee's own Hub lists the shared project
+    // once Drive shows it in their shared view.
     styleLabel (inviteLabel);
     inviteLabel.setText ("Invite to a project", juce::NotificationType::dontSendNotification);
     addAndMakeVisible (inviteLabel);
@@ -1212,21 +1214,38 @@ void OnorabAudioProcessorEditor::connectDrive (const juce::String& email)
             settingsTab->setDriveStatus ("Drive connected (" + detail + ").");
             return;
         }
-        // Not connected yet: ask the Hub to start auth. In Mock mode
-        // this returns 501 oauth_unavailable — reported honestly, not
-        // faked into a login.
-        hub.startAuth ([this, email] (bool authOk, juce::String authError, juce::String)
+        // Not connected yet: ask the Hub to start auth. The Hub returns
+        // a Google sign-in URL; the plugin opens it in the user's
+        // browser (Google's own page — the plugin never sees a
+        // password). In Mock mode this returns oauth_unavailable,
+        // reported honestly, not faked into a login. Commercial note:
+        // every PC signs in with its OWN Gmail; the token stays on
+        // that PC's Credential Manager, so a buyer never uses the
+        // seller's Google account.
+        hub.startAuth ([this, email] (bool authOk, juce::String authError, juce::String authUrl)
         {
             if (settingsTab == nullptr)
                 return;
             if (! authOk && authError.containsIgnoreCase ("oauth_unavailable"))
+            {
                 settingsTab->setDriveStatus ("Drive is not connected yet — the Hub is in Mock mode. "
-                                             "Real Google sign-in with " + email + " arrives with the "
-                                             "Drive provider in Phase 2; nothing was sent to Google.");
+                                             "Start the Hub with ONORAB_DRIVE_PROVIDER=drive, then press Connect Drive again.");
+            }
+            else if (authOk && authUrl.startsWith ("https://"))
+            {
+                juce::URL (authUrl).launchInDefaultBrowser();
+                settingsTab->setDriveStatus ("Browser opened — sign in with YOUR Gmail (" + email + "), "
+                                             "approve drive.file access, then press Refresh in Cloud Library. "
+                                             "Your token stays on this PC only.");
+            }
             else if (authOk)
-                settingsTab->setDriveStatus ("Drive sign-in started — follow the Hub/browser prompt.");
+            {
+                settingsTab->setDriveStatus ("Drive sign-in started — follow the browser prompt, then press Refresh.");
+            }
             else
+            {
                 settingsTab->setDriveStatus ("Drive connect failed: " + authError);
+            }
         });
     });
 }
@@ -1252,9 +1271,9 @@ void OnorabAudioProcessorEditor::inviteToProject (const juce::String& email, con
             return;
         if (ok)
             settingsTab->setInviteStatus ("Invite recorded for " + email + " on project " + project
-                                          + " (pending). Real Drive sharing of "
+                                          + ". In Drive mode this also creates a real Drive writer permission on "
                                           + HubClient::projectFolder (project)
-                                          + " arrives in Phase 2 — they cannot access it yet.");
+                                          + "; in Mock mode it is a local record only.");
         else
             settingsTab->setInviteStatus ("Invite failed: " + error);
     });

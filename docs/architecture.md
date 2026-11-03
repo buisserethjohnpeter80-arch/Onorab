@@ -195,6 +195,63 @@ Rules:
   `Onorab_projet/<project>/`, so the invited user sees the same
   project, in the same creation order, from their own FL Studio.
 
+### 3.4 Commercial multi-PC model (user decision, 2026-11-03)
+
+The VST is a commercial product installed on many PCs. That changes
+the credential model completely — the Phase 1 assumption ("the
+developer's credentials.json lives on his PC only") is WRONG for a
+shipped product and is replaced by this:
+
+- **The OAuth client is Onorab's app identity, not a per-PC secret.**
+  Every installation uses the SAME Google OAuth client (one Desktop
+  app client, created once in Google Cloud Console). A buyer never
+  needs their own Google Cloud project, and never uses the seller's
+  Google account.
+- **Every PC signs in with its owner's Gmail.** First run: Settings →
+  Connect Drive → Hub returns a Google sign-in URL → plugin opens it
+  in the browser → user approves `drive.file` only → Google redirects
+  to the Hub's loopback listener → Hub exchanges the PKCE code for
+  tokens. The plugin never sees a password; the Hub never receives
+  one.
+- **Tokens stay on that PC only.** The refresh token goes to Windows
+  Credential Manager (`Onorab:drive:default`, per Windows user). The
+  access token lives in Hub memory only. Copying the VST/Hub to
+  another PC does NOT carry a sign-in: that PC signs in itself.
+  After the first sign-in, reconnect is automatic: the Hub loads the
+  refresh token and mints fresh access tokens without a browser.
+- **No secret in the repo, no secret in the binary.** For Desktop
+  apps with PKCE, the token exchange needs no client secret, so the
+  shipped binary contains only a client id — and even that id is NOT
+  in the repo: the release build injects it from a GitHub Actions
+  secret (`ONORAB_OAUTH_CLIENT_ID`) via
+  `-X main.buildOAuthClientID=...` (see the Build Hub step note in
+  the workflows; the Muse GitHub App cannot edit workflow files, so
+  the owner adds that flag + secret manually). Dev runs use
+  `ONORAB_OAUTH_CLIENT_ID` env or a Desktop OAuth JSON at
+  `ONORAB_CREDENTIALS_PATH` — dev only, never committed, never sent
+  in chat.
+- **Testing-mode limits (until Production + verification):** only
+  Test users (max 100, added in the OAuth consent screen) can sign
+  in; every new user sees the "Google hasn't verified this app"
+  screen (Advanced → Go to Onorab); refresh tokens expire after
+  **7 days**, so buyers re-sign weekly. Before selling: publish the
+  app to Production and pass Google verification (consent screen
+  with app homepage, Privacy Policy URL, Terms, support contact,
+  and a demo video showing the drive.file use). drive.file is the
+  narrowest Drive scope — it is what makes verification plausible;
+  full-drive scope would not be.
+- **drive.file sharing limitation (honest):** an invited user's Hub
+  lists a shared project once Drive shows that folder in their
+  "Shared with me" view. The plugin's invite status says so; it does
+  not promise instant cross-PC visibility.
+- **Still to do for a professional release (not in this batch):**
+  a real Windows installer (VST3 to `Common Files\VST3`, Hub
+  auto-start, uninstaller) instead of a raw ZIP; code signing so
+  Windows SmartScreen does not warn on install; a license-key
+  system if sales are per-seat; versioned auto-update for Hub +
+  VST; and crash/error reporting that never includes tokens or
+  audio content. None of these change the Drive model above.
+
 ### 3.4 Mobile <-> Drive
 
 - Phase 1: the mobile app runs in **mock mode** with local mock data. It

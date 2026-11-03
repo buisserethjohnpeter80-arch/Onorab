@@ -71,11 +71,20 @@ Result: `build/Onorab_artefacts/Release/VST3/Onorab.vst3/`
     project was created, uploads appended at the end) — never
     alphabetical. An invited user's upload from another FL Studio
     appears at the end, in order.
-12. **Settings → Google Drive / Invite:** enter a Gmail and press
-    **Connect Drive** (in Mock mode this honestly reports that real
-    Google sign-in is not ready yet), or enter an invited Gmail +
-    project and press **Invite** (records a pending invite on the Hub;
-    real Drive sharing of `Onorab_projet/<project>/` is Phase 2).
+12. **Settings → Google Drive / Invite (commercial model):** in Drive
+    mode, enter YOUR Gmail and press **Connect Drive** — the plugin
+    opens Google's sign-in page in your browser; approve `drive.file`
+    only, then press **Refresh** in Cloud Library. Your token stays
+    in Windows Credential Manager on THIS PC only; a buyer on
+    another PC signs in with their own Gmail, never yours. In Mock
+    mode Connect Drive honestly reports `oauth_unavailable`. **Invite:**
+    enter an invited Gmail + project and press **Invite** — in Drive
+    mode this creates a real Drive writer permission on
+    `Onorab_projet/<project>/` (the invitee's Hub lists it once Drive
+    shows it in their shared view); in Mock mode it is a local record
+    only. While the Google app is in Testing mode, only Test users can
+    sign in and refresh tokens expire after 7 days — Production +
+    verification removes both limits (see architecture §3.4).
 13. **Onorab Bus (track-by-track capture):** the plugin cannot create
     a Mixer track or route tracks — do that by hand in FL Studio:
     (a) pick an empty Mixer track, name it `Onorab`, load Onorab on it
@@ -127,12 +136,11 @@ Result: `build/Onorab_artefacts/Release/VST3/Onorab.vst3/`
 ## What is NOT done yet (Phase 1 honesty list)
 
 - **No WebSocket `/events` client** — transfers/health are polled every 2 s.
-- **No real Google Drive in this plugin** — Drive sync is Hub-side; with
-  the Hub's Mock Drive Provider, the library shows mock audio files.
-- **Projects are Hub-synced by name only so far** — project sounds are
-  grouped by `projectId` and Push/Upload target
-  `Onorab_projet/<project>/`, but real Drive folder creation is still
-  Phase 2 (the Hub currently runs the Mock provider).
+- **No Google sign-in in this plugin** — Drive sync and OAuth are
+  Hub-side; the plugin only opens the Hub's Google sign-in URL and
+  shows Hub auth status. With the Hub's Mock provider, the library
+  shows mock audio files; with `ONORAB_DRIVE_PROVIDER=drive`, it shows
+  the signed-in user's real Drive files under `Onorab_projet/`.
 - **Drag-out depends on the host.** The plugin provides the file path via
   JUCE external drag; FL Studio must accept the drop (its Playlist /
   Channel Rack accept audio files, but the plugin cannot force acceptance).

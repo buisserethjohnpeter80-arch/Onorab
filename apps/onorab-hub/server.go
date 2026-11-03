@@ -257,6 +257,10 @@ type Server struct {
 	cfg   Config
 	store *Store
 	oauth *OAuthGuard
+	// Drive mode only (nil in Mock mode). driveAuth owns the signed-in
+	// user's tokens; drive is the Drive API client using those tokens.
+	drive     *DriveClient
+	driveAuth *DriveAuth
 }
 
 func NewServer(cfg Config) (*Server, error) {
@@ -264,7 +268,24 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{cfg: cfg, store: store, oauth: NewOAuthGuard()}, nil
+	s := &Server{cfg: cfg, store: store, oauth: NewOAuthGuard()}
+	if cfg.Provider == "drive" {
+		clientID, clientSecret, err := resolveOAuthClient(cfg.Credentials)
+		if err != nil {
+			return nil, err
+		}
+		auth := newDriveAuth(clientID, clientSecret, newPlatformTokenStore())
+		s.driveAuth = auth
+		s.drive = newDriveClient(auth.GetAccessToken)
+		// Best-effort automatic reconnect: if this PC already has a
+		// stored refresh token, mint an access token now so the Hub
+		// starts authenticated. Failure here is NOT fatal — the user
+		// signs in via Settings → Connect Drive.
+		_, _ = auth.GetAccessToken()
+	} else if cfg.Provider != "mock" && cfg.Provider != "" {
+		return nil, fmt.Errorf("unknown drive provider %q (use mock or drive)", cfg.Provider)
+	}
+	return s, nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -314,6 +335,18 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "invalid_request", "method %s not allowed on /files", r.Method)
 		return
 	}
+	if s.drive != nil {
+		files, err := s.drive.ListAll()
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "not_authenticated", "Drive list failed: %v", err)
+			return
+		}
+		if files == nil {
+			files = []OnorabFile{}
+		}
+		writeJSON(w, http.StatusOK, files)
+		return
+	}
 	writeJSON(w, http.StatusOK, s.store.listFiles())
 }
 
@@ -334,6 +367,18 @@ func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSuffix(path, "/delete")
 	if id == "" || strings.Contains(id, "/") {
 		writeError(w, http.StatusBadRequest, "invalid_request", "a file id is required in /files/{id}")
+		return
+	}
+	if s.drive != nil {
+		if err := s.drive.Delete(id); err != nil {
+			if strings.Contains(err.Error(), "not_found") {
+				writeError(w, http.StatusNotFound, "not_found", "no file with id %q", id)
+			} else {
+				writeError(w, http.StatusUnauthorized, "not_authenticated", "Drive delete failed: %v", err)
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, OnorabFile{ID: id})
 		return
 	}
 	file, ok := s.store.deleteFile(id)
@@ -372,7 +417,18 @@ func (s *Server) handleInvites(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_invite", "invite needs an email containing '@' and a project name")
 			return
 		}
-		invite := OnorabInvite{Email: email, Project: project, Status: "pending", CreatedAt: nowISO()}
+		status := "pending"
+		if s.drive != nil {
+			if _, err := s.drive.Share(project, email); err != nil {
+				writeError(w, http.StatusUnauthorized, "not_authenticated", "Drive share failed: %v", err)
+				return
+			}
+			// Drive permission created: the invite is real, not just
+			// recorded. (The invitee's own Hub lists the shared
+			// project once Drive shows it in their shared view.)
+			status = "accepted"
+		}
+		invite := OnorabInvite{Email: email, Project: project, Status: status, CreatedAt: nowISO()}
 		s.store.mu.Lock()
 		s.store.invites = append(s.store.invites, invite)
 		s.store.mu.Unlock()
@@ -391,10 +447,19 @@ func (s *Server) handleTransfers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	if s.driveAuth != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"provider": s.cfg.Provider, "authenticated": s.driveAuth.Authenticated(),
+			"account": s.driveAuth.Account(),
+			"oauthInProgress": s.oauth.InProgress(),
+			"note":            "Real Google Drive (drive.file only). Each PC signs in with its owner's Gmail; tokens stay in that PC's OS keychain.",
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"provider": s.cfg.Provider, "authenticated": false,
 		"oauthInProgress": s.oauth.InProgress(),
-		"note":            "Phase 1 uses the Mock Drive Provider; no Google account is connected.",
+		"note":            "Mock Drive Provider; no Google account is connected. Start the Hub with ONORAB_DRIVE_PROVIDER=drive to use real Drive.",
 	})
 }
 
@@ -461,6 +526,36 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_upload", "uploaded file has no usable name")
 		return
 	}
+	if s.drive != nil {
+		project := sanitiseProjectName(r.FormValue("project"))
+		data, err := io.ReadAll(fh)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal", "could not read upload: %v", err)
+			return
+		}
+		mime := header.Header.Get("Content-Type")
+		if mime == "" {
+			mime = "audio/wav"
+		}
+		transfer := &OnorabTransfer{ID: newID("tr"), FileName: name, Direction: "upload", Status: "queued", Progress: 0}
+		s.store.recordTransfer(transfer)
+		if err := transfer.transition("uploading"); err != nil {
+			s.store.finishTransfer(transfer, err)
+			writeError(w, http.StatusInternalServerError, "internal", "%v", err)
+			return
+		}
+		file, err := s.drive.Upload(project, name, data, mime)
+		if err != nil {
+			s.store.finishTransfer(transfer, err)
+			writeError(w, http.StatusUnauthorized, "not_authenticated", "Drive upload failed: %v", err)
+			return
+		}
+		transfer.FileID = file.ID
+		s.store.finishTransfer(transfer, nil)
+		s.store.events.Broadcast(OnorabEvent{Type: "file.added", Timestamp: nowISO(), File: &file})
+		writeJSON(w, http.StatusCreated, file)
+		return
+	}
 	id := newID("file")
 	transfer := &OnorabTransfer{ID: newID("tr"), FileID: id, FileName: name, Direction: "upload", Status: "queued", Progress: 0}
 	s.store.recordTransfer(transfer)
@@ -510,6 +605,35 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/downloads/")
 	if id == "" || strings.Contains(id, "/") {
 		writeError(w, http.StatusBadRequest, "invalid_request", "a file id is required in /downloads/{fileId}")
+		return
+	}
+	if s.drive != nil {
+		meta, err := s.drive.GetFile(id)
+		if err != nil {
+			if strings.Contains(err.Error(), "not_found") {
+				writeError(w, http.StatusNotFound, "not_found", "no file with id %q", id)
+			} else {
+				writeError(w, http.StatusUnauthorized, "not_authenticated", "Drive download failed: %v", err)
+			}
+			return
+		}
+		transfer := &OnorabTransfer{ID: newID("tr"), FileID: id, FileName: meta.Name, Direction: "download", Status: "queued", Progress: 0}
+		s.store.recordTransfer(transfer)
+		_ = transfer.transition("downloading")
+		data, err := s.drive.Download(id)
+		if err != nil {
+			s.store.finishTransfer(transfer, err)
+			writeError(w, http.StatusInternalServerError, "internal", "%v", err)
+			return
+		}
+		w.Header().Set("Content-Type", meta.MimeType)
+		w.Header().Set("Content-Disposition", "attachment; filename="+meta.Name)
+		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+		if _, err := w.Write(data); err != nil {
+			s.store.finishTransfer(transfer, err)
+			return
+		}
+		s.store.finishTransfer(transfer, nil)
 		return
 	}
 	s.store.mu.Lock()
