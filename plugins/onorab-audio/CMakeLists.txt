@@ -47,6 +47,14 @@ juce_add_plugin(Onorab
     VST3_CATEGORIES "Fx"
 )
 
+# REQUIRED (do not remove): juce_add_plugin does NOT create JuceHeader.h
+# by itself in JUCE 8.0.8 — this call is what generates it (via the
+# juceaide tool at build time). Without it every plugin source fails
+# with C1083 "Cannot open include file: 'JuceHeader.h'". This line was
+# lost when a later push overwrote the file from a stale local copy;
+# it must survive every future edit of this file.
+juce_generate_juce_header(Onorab)
+
 target_sources(Onorab
     PRIVATE
         Source/PluginProcessor.cpp
