@@ -1160,6 +1160,13 @@ void SettingsTab::setDriveConnected (bool connected, const juce::String& account
     disconnectDriveButton.setVisible (connected);
 }
 
+// The Connect button doubles as "Try again" after a failed sign-in
+// (refreshDriveStatus sets it); starting a fresh attempt resets it.
+void SettingsTab::setConnectButtonText (const juce::String& text)
+{
+    connectDriveButton.setButtonText (text);
+}
+
 void SettingsTab::setDriveMessage (const juce::String& text)
 {
     driveMessageLabel.setText (text, juce::NotificationType::dontSendNotification);
@@ -1495,12 +1502,18 @@ void OnorabAudioProcessorEditor::timerCallback()
         syncPlayerState();
     }
     // Polling only (Phase 1): health + transfers every 2 seconds,
-    // Drive auth status every 10 seconds. Lightweight localhost traffic;
-    // a WebSocket /events client replaces it in Phase 2.
+    // Drive auth status every 10 seconds. While a browser sign-in
+    // is in flight (authAwaiting), auth status joins the 2-second
+    // poll so "Drive connected" (or the failure + "Try again")
+    // appears promptly instead of up to 10 seconds late.
+    // Lightweight localhost traffic; a WebSocket /events client
+    // replaces it in Phase 2.
     if (timerTicks % 2 == 0)
     {
         checkHealth();
         refreshTransfers (true);
+        if (authAwaiting)
+            refreshDriveStatus();
     }
     if (timerTicks % 10 == 0)
         refreshDriveStatus();
@@ -1936,6 +1949,7 @@ void OnorabAudioProcessorEditor::connectDrive()
         }
         if (detail.contains ("authenticated: 1") || detail.contains ("authenticated: true"))
         {
+            authAwaiting = false;
             settingsTab->setDriveMessage ("Drive connected.");
             refreshDriveStatus();
             return;
@@ -1957,23 +1971,33 @@ void OnorabAudioProcessorEditor::connectDrive()
                 return;
             if (! authOk && authError.containsIgnoreCase ("oauth_unavailable"))
             {
+                authAwaiting = false;
                 settingsTab->setDriveMessage ("Drive is not connected yet - the Hub is in Mock mode. "
                                               "Start the Hub with ONORAB_DRIVE_PROVIDER=drive, then press Connect Drive again.");
             }
             else if (authOk && authUrl.startsWith ("https://"))
             {
                 juce::URL (authUrl).launchInDefaultBrowser();
-                settingsTab->setDriveMessage ("Browser opened - sign in with your Google account and "
-                                              "approve drive.file access, then wait: this panel shows "
-                                              "\"Drive connected\" once the Hub confirms it. "
-                                              "Your token stays on this PC only.");
+                // From here until the Hub confirms (or reports a
+                // failure), the panel shows "Waiting for Google…"
+                // and the timer polls auth status every 2 seconds.
+                // The browser success page itself now appears only
+                // after the Hub exchanged the code AND stored the
+                // token, so "Waiting" never turns into a false
+                // "connected".
+                authAwaiting = true;
+                settingsTab->setConnectButtonText ("Connect Google Drive");
+                settingsTab->setDriveMessage ("Waiting for Google…");
             }
             else if (authOk)
             {
-                settingsTab->setDriveMessage ("Drive sign-in started - follow the browser prompt.");
+                authAwaiting = true;
+                settingsTab->setConnectButtonText ("Connect Google Drive");
+                settingsTab->setDriveMessage ("Waiting for Google…");
             }
             else
             {
+                authAwaiting = false;
                 settingsTab->setDriveMessage ("Drive connect failed: " + authError);
             }
         });
@@ -1991,6 +2015,10 @@ void OnorabAudioProcessorEditor::disconnectDrive()
             return;
         if (ok)
         {
+            // A fresh Connect after this must not inherit a stale
+            // "Try again" button or a lingering "Waiting" state.
+            authAwaiting = false;
+            settingsTab->setConnectButtonText ("Connect Google Drive");
             settingsTab->setDriveMessage ("Drive disconnected on this PC.");
             refreshDriveStatus();
         }
@@ -2320,6 +2348,9 @@ void OnorabAudioProcessorEditor::applySettings (const juce::String& hubUrl, cons
         audioProcessor.setCacheDir (cacheDir);
     if (settingsTab != nullptr)
         settingsTab->setStatus ("Saved - Hub URL and cache folder updated (saved with the project).");
+    // A URL change re-arms the auto-launch: switching back to the
+    // default Hub after a custom one deserves a fresh attempt.
+    hubLaunchAttempted = false;
     checkHealth();
     refreshFiles();
 }
@@ -2333,8 +2364,66 @@ void OnorabAudioProcessorEditor::checkHealth()
         hubStatusLabel.setText (ok ? "Hub connected" : "Hub disconnected",
                                 juce::NotificationType::dontSendNotification);
         if (! ok)
+        {
             DBG ("Onorab Hub health check failed: " << error);
+            tryLaunchInstalledHub();
+        }
     });
+}
+
+void OnorabAudioProcessorEditor::tryLaunchInstalledHub()
+{
+    if (hubLaunchAttempted)
+        return;
+    hubLaunchAttempted = true;
+    // Only the default localhost Hub is auto-launched: a custom URL
+    // means the user runs their own Hub and this plugin must not
+    // start a second one on the default port.
+    if (getHubUrl().trim() != "http://127.0.0.1:18741")
+        return;
+#if JUCE_WINDOWS
+    // Well-known installer locations (see dist/windows/installer.nsi):
+    // the Hub lives machine-wide under Program Files so every Windows
+    // user on the PC finds the same file; the per-user AppData path
+    // is kept as a fallback for manual installs.
+    const juce::StringArray roots = {
+        juce::SystemStats::getEnvironmentVariable ("ProgramFiles", ""),
+        juce::SystemStats::getEnvironmentVariable ("ProgramFiles(x86)", ""),
+        juce::SystemStats::getEnvironmentVariable ("LOCALAPPDATA", "")
+    };
+    juce::File hubExe;
+    for (const auto& root : roots)
+    {
+        if (root.isEmpty())
+            continue;
+        juce::File candidate = juce::File (root).getChildFile ("Onorab")
+                                                .getChildFile ("onorab-hub.exe");
+        if (candidate.existsAsFile())
+        {
+            hubExe = candidate;
+            break;
+        }
+    }
+    if (hubExe == juce::File())
+    {
+        // No installed Hub: the musician either has not run the
+        // installer, or runs the Hub manually. Say so once (not on
+        // every 2-second health poll) instead of failing silently.
+        setError ("Onorab Hub is not running and no installed Hub was found - "
+                  "run the Onorab installer, then reopen this plugin.");
+        return;
+    }
+    // Launch-and-forget: the ChildProcess object dies here but the
+    // child keeps running (JUCE never kills a child on destruction),
+    // so the Hub survives FL closing and the next editor open finds
+    // it via the health check. The -provider flag replaces the env
+    // var the musician must never touch. On Windows JUCE launches
+    // with CREATE_NO_WINDOW, so no console window appears.
+    juce::ChildProcess launcher;
+    const juce::String command = "\"" + hubExe.getFullPathName() + "\" -provider drive";
+    if (! launcher.start (command))
+        setError ("Onorab Hub could not be started from " + hubExe.getFullPathName());
+#endif
 }
 
 void OnorabAudioProcessorEditor::refreshDriveStatus()
@@ -2346,20 +2435,76 @@ void OnorabAudioProcessorEditor::refreshDriveStatus()
         driveConnected = detail.contains ("authenticated: 1")
                       || detail.contains ("authenticated: true");
         // Detail format (HubClient): "provider: ..., authenticated: ...,
-        // account: <email>". The account is display-only: an empty
-        // account with authenticated=true still counts as connected.
-        juce::String account;
+        // account: <email>, oauthInProgress: ..., authError: <message>".
+        // The account is display-only: an empty account with
+        // authenticated=true still counts as connected. authError is
+        // the tail (its message may contain commas), account ends at
+        // ", oauthInProgress:"; both markers are absent for old Hub
+        // builds, which fall back to "to end" parsing.
+        juce::String account, authError;
         const int accountPos = detail.indexOf ("account: ");
         if (accountPos >= 0)
-            account = detail.substring (accountPos + 9).trim();
-        if (driveConnected != prevDriveConnected && settingsTab != nullptr)
-            settingsTab->setDriveMessage (driveConnected ? "Drive connected." : "Not connected.");
+        {
+            const int accountEnd = detail.indexOf (", oauthInProgress:", accountPos);
+            account = (accountEnd >= 0 ? detail.substring (accountPos + 9, accountEnd)
+                                       : detail.substring (accountPos + 9)).trim();
+        }
+        const int errorPos = detail.indexOf ("authError: ");
+        if (errorPos >= 0)
+            authError = detail.substring (errorPos + 11).trim();
+        const bool authInProgress = detail.contains ("oauthInProgress: 1")
+                                 || detail.contains ("oauthInProgress: true");
+        const bool wasConnected = prevDriveConnected;
         prevDriveConnected = driveConnected;
         driveDot.setDotColour (driveConnected ? kGreen : kGrey);
         driveStatusLabel.setText (driveConnected ? "Drive connected" : "Drive not connected",
                                   juce::NotificationType::dontSendNotification);
         if (settingsTab != nullptr)
             settingsTab->setDriveConnected (driveConnected, account);
+        if (driveConnected)
+        {
+            authAwaiting = false;
+            if (settingsTab != nullptr)
+            {
+                settingsTab->setConnectButtonText ("Connect Google Drive");
+                if (! wasConnected)
+                    settingsTab->setDriveMessage ("Drive connected.");
+            }
+        }
+        else if (authError.isNotEmpty() && ! authInProgress)
+        {
+            // A reported failure (cancel, refused exchange, keychain
+            // store failure, timeout): show it with "Try again"
+            // instead of a silent "Not connected".
+            authAwaiting = false;
+            if (settingsTab != nullptr)
+            {
+                settingsTab->setDriveMessage ("Drive sign-in failed: " + authError + " - press Try again.");
+                settingsTab->setConnectButtonText ("Try again");
+            }
+        }
+        else if (authInProgress)
+        {
+            // Sign-in still running: keep "Waiting for Google…" —
+            // do not overwrite it with "Not connected" while the
+            // browser flow is in flight.
+        }
+        else if (authAwaiting)
+        {
+            // The Hub says no session is running, but the plugin is
+            // still waiting on one: it ended without a report (old
+            // Hub build, or an edge case). Do not wait forever on
+            // "Waiting…".
+            authAwaiting = false;
+            if (settingsTab != nullptr)
+                settingsTab->setDriveMessage ("Drive sign-in did not complete - press Connect Drive again.");
+        }
+        else if (wasConnected && settingsTab != nullptr)
+        {
+            // Connected -> not connected between polls (e.g. the
+            // token was revoked): report the transition once.
+            settingsTab->setDriveMessage ("Not connected.");
+        }
     });
 }
 

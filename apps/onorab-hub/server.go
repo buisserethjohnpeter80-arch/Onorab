@@ -457,7 +457,11 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 			"provider": s.cfg.Provider, "authenticated": s.driveAuth.Authenticated(),
 			"account": s.driveAuth.Account(),
 			"oauthInProgress": s.oauth.InProgress(),
-			"note":            "Real Google Drive (drive.file only). Each PC signs in with its owner's Gmail; tokens stay in that PC's OS keychain.",
+			// Last sign-in failure in plain words ("" when none):
+			// the plugin shows it with a "Try again" button instead
+			// of a silent authenticated=false.
+			"authError": s.driveAuth.LastAuthError(),
+			"note":      "Real Google Drive (drive.file only). Each PC signs in with its owner's Gmail; tokens stay in that PC's OS keychain.",
 		})
 		return
 	}

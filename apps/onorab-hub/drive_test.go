@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 // RFC 7636 Appendix B test vector: this verifier must produce this
@@ -40,9 +42,219 @@ func TestAuthURLParams(t *testing.T) {
 
 func TestResolveClientIDFromEnv(t *testing.T) {
 	t.Setenv("ONORAB_OAUTH_CLIENT_ID", "env-client-id")
+	t.Setenv("ONORAB_OAUTH_CLIENT_SECRET", "")
 	id, secret, err := resolveOAuthClient("")
 	if err != nil || id != "env-client-id" || secret != "" {
 		t.Fatalf("env resolution wrong: id=%q secret=%q err=%v", id, secret, err)
+	}
+}
+
+// The distributed build must carry the id + secret as a PAIR (the
+// reported bug: an id-only distributed build opened the browser,
+// Google approved, but the code exchange failed and /auth/status
+// stayed authenticated=false). A distribution build with an id but
+// no secret must fail fast instead of shipping silently broken.
+func TestResolveOAuthClientBakedPairAndDistributionGuard(t *testing.T) {
+	t.Setenv("ONORAB_OAUTH_CLIENT_ID", "")
+	t.Setenv("ONORAB_OAUTH_CLIENT_SECRET", "")
+	oldID, oldSecret, oldDist := buildOAuthClientID, buildOAuthClientSecret, buildDistribution
+	t.Cleanup(func() {
+		buildOAuthClientID, buildOAuthClientSecret, buildDistribution = oldID, oldSecret, oldDist
+	})
+
+	buildOAuthClientID, buildOAuthClientSecret, buildDistribution = "baked-id", "baked-secret", "true"
+	if id, secret, err := resolveOAuthClient(""); err != nil || id != "baked-id" || secret != "baked-secret" {
+		t.Fatalf("baked pair wrong: id=%q secret-set=%v err=%v", id, secret != "", err)
+	}
+
+	buildOAuthClientSecret = ""
+	if _, _, err := resolveOAuthClient(""); err == nil || !strings.Contains(err.Error(), "client secret") {
+		t.Fatalf("distribution build without a secret must fail fast, got err=%v", err)
+	}
+
+	// A non-distribution (dev) build with an id but no secret is
+	// still allowed: PKCE-only, same as before.
+	buildDistribution = ""
+	if id, secret, err := resolveOAuthClient(""); err != nil || id != "baked-id" || secret != "" {
+		t.Fatalf("dev id-only build wrong: id=%q secret=%q err=%v", id, secret, err)
+	}
+
+	// Env always wins over baked values, as a pair.
+	t.Setenv("ONORAB_OAUTH_CLIENT_ID", "env-id")
+	t.Setenv("ONORAB_OAUTH_CLIENT_SECRET", "env-secret")
+	if id, secret, err := resolveOAuthClient(""); err != nil || id != "env-id" || secret != "env-secret" {
+		t.Fatalf("env pair must win over baked: id=%q secret=%q err=%v", id, secret, err)
+	}
+}
+
+// startBrowserSession against stub Google endpoints: the test drives
+// the loopback redirect itself (parsing state + redirect_uri out of
+// the returned auth URL), the way a browser would after Google
+// approval.
+func TestBrowserSessionSuccessPageOnlyAfterExchange(t *testing.T) {
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("token stub form parse: %v", err)
+		}
+		if r.Form.Get("client_id") != "id" || r.Form.Get("client_secret") != "sec" ||
+			r.Form.Get("code") != "testcode" || r.Form.Get("code_verifier") == "" ||
+			r.Form.Get("redirect_uri") == "" {
+			t.Errorf("token stub got wrong form: %v", r.Form)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "access-1", "refresh_token": "refresh-1", "expires_in": 3600,
+		})
+	}))
+	defer tokenSrv.Close()
+	userinfoSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"email": "singer@example.com"})
+	}))
+	defer userinfoSrv.Close()
+
+	store := NewMemoryTokenStore()
+	auth := newDriveAuth("id", "sec", store)
+	auth.tokenURL = tokenSrv.URL
+	auth.userinfoURL = userinfoSrv.URL
+
+	authURL, done, err := auth.startBrowserSession()
+	if err != nil {
+		t.Fatalf("startBrowserSession failed: %v", err)
+	}
+	u, err := url.Parse(authURL)
+	if err != nil {
+		t.Fatalf("auth URL unparsable: %v", err)
+	}
+	redirectURI, state := u.Query().Get("redirect_uri"), u.Query().Get("state")
+	resp, err := http.Get(redirectURI + "?code=testcode&state=" + state)
+	if err != nil {
+		t.Fatalf("redirect GET failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var body strings.Builder
+	if _, err := body.ReadFrom(resp.Body); err != nil {
+		t.Fatalf("read redirect body: %v", err)
+	}
+	if !strings.Contains(body.String(), "Onorab is connected") {
+		t.Fatalf("success page missing after successful exchange: %q", body.String())
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("session done must be nil, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("session done timed out")
+	}
+	if tok, err := store.Load("default"); err != nil || tok != "refresh-1" {
+		t.Fatalf("refresh token not stored: tok=%q err=%v", tok, err)
+	}
+	if auth.LastAuthError() != "" {
+		t.Fatalf("lastAuthError must be empty after success, got %q", auth.LastAuthError())
+	}
+}
+
+func TestBrowserSessionExchangeFailureShowsErrorNotSuccess(t *testing.T) {
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": "invalid_client", "error_description": "client not found",
+		})
+	}))
+	defer tokenSrv.Close()
+
+	store := NewMemoryTokenStore()
+	auth := newDriveAuth("id", "sec", store)
+	auth.tokenURL = tokenSrv.URL
+
+	authURL, done, err := auth.startBrowserSession()
+	if err != nil {
+		t.Fatalf("startBrowserSession failed: %v", err)
+	}
+	u, _ := url.Parse(authURL)
+	resp, err := http.Get(u.Query().Get("redirect_uri") + "?code=testcode&state=" + u.Query().Get("state"))
+	if err != nil {
+		t.Fatalf("redirect GET failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var body strings.Builder
+	_, _ = body.ReadFrom(resp.Body)
+	if strings.Contains(body.String(), "Onorab is connected") {
+		t.Fatalf("error page must never say connected: %q", body.String())
+	}
+	if !strings.Contains(body.String(), "invalid_client") {
+		t.Fatalf("error page must name the failure: %q", body.String())
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("session done must carry the exchange error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("session done timed out")
+	}
+	if _, err := store.Load("default"); err == nil {
+		t.Fatal("no token may be stored after a failed exchange")
+	}
+	if auth.LastAuthError() == "" {
+		t.Fatal("lastAuthError must report the failed exchange")
+	}
+}
+
+func TestBrowserSessionCancelReportsFailure(t *testing.T) {
+	store := NewMemoryTokenStore()
+	auth := newDriveAuth("id", "sec", store)
+
+	authURL, done, err := auth.startBrowserSession()
+	if err != nil {
+		t.Fatalf("startBrowserSession failed: %v", err)
+	}
+	u, _ := url.Parse(authURL)
+	resp, err := http.Get(u.Query().Get("redirect_uri") + "?error=access_denied&state=" + u.Query().Get("state"))
+	if err != nil {
+		t.Fatalf("redirect GET failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var body strings.Builder
+	_, _ = body.ReadFrom(resp.Body)
+	if !strings.Contains(body.String(), "cancelled") {
+		t.Fatalf("cancel page must say cancelled: %q", body.String())
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancelled session must report an error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("session done timed out")
+	}
+	if !strings.Contains(auth.LastAuthError(), "cancelled") {
+		t.Fatalf("lastAuthError must report the cancel, got %q", auth.LastAuthError())
+	}
+}
+
+func TestRefreshInvalidGrantClearsStoredToken(t *testing.T) {
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": "invalid_grant", "error_description": "Token has been expired or revoked.",
+		})
+	}))
+	defer tokenSrv.Close()
+
+	store := NewMemoryTokenStore()
+	_ = store.Save("default", "dead-refresh")
+	_ = store.Save("default:account", "singer@example.com")
+	auth := newDriveAuth("id", "sec", store)
+	auth.tokenURL = tokenSrv.URL
+
+	if _, err := auth.GetAccessToken(); err == nil || !strings.Contains(err.Error(), "revoked") {
+		t.Fatalf("revoked refresh must report re-sign-in, got err=%v", err)
+	}
+	if _, err := store.Load("default"); err == nil {
+		t.Fatal("revoked refresh token must be deleted")
+	}
+	if _, err := store.Load("default:account"); err == nil {
+		t.Fatal("stored account must be deleted with a revoked token")
 	}
 }
 

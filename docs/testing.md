@@ -208,6 +208,41 @@ Pass / Fail + notes for each. Do not skip the error cases at the end.
       number / artifact name) recorded with the results.
 - [ ] No checklist item marked Pass without actually running it.
 
+### I. Installer + distributed Drive sign-in (real PC only, 2026-11-04)
+
+None of these can be proven by CI or by this VM: they run only on a
+real Windows PC with the installer artifact from a GitHub Actions
+run. Do NOT mark any of them Pass without running them there.
+
+- [ ] **I1. Clean-account install.** On a Windows account with no
+      JSON, no OAuth env vars, and no previous Onorab install, run
+      Onorab-Installer.exe: Onorab.vst3 lands in
+      `Common Files\VST3`, onorab-hub.exe in `Program Files\Onorab`,
+      and FL Studio lists the plugin. (SmartScreen "Run anyway"
+      expected until code signing exists.)
+- [ ] **I2. One Hub for two instances.** Open FL, load Onorab on two
+      Mixer Tracks: the Hub starts once (one onorab-hub.exe in Task
+      Manager), both instances show "Hub connected", no console
+      window appears.
+- [ ] **I3. Distributed sign-in.** Settings → Connect Google Drive
+      → browser sign-in with a Test-user Gmail → plugin shows
+      "Waiting for Google…" then "Drive connected" + "Connected as
+      …", and the browser success page appears only after the
+      sign-in truly completed. Library loads real Drive files.
+- [ ] **I4. Small WAV to Drive.** Capture or push a small WAV and
+      verify the file appears in Drive under
+      `Onorab_projet/<project>/`.
+- [ ] **I5. Reopen FL.** Close and reopen FL: Drive is still
+      connected with no browser prompt (token resumed + refreshed
+      from Credential Manager).
+- [ ] **I6. Cancel / Try again / Disconnect.** Cancel on Google's
+      page → plugin shows the failure + "Try again"; a second
+      attempt succeeds; Disconnect removes the sign-in and the
+      plugin shows "Not connected", and Connect works again after.
+- [ ] **I7. Restart the PC.** After a reboot, opening FL reconnects
+      Drive with no sign-in prompt (Hub auto-launched, token
+      resumed).
+
 ## 4. Manual mobile checklist (mock mode)
 
 - [ ] **M1.** App opens to the Google account connection screen; mock

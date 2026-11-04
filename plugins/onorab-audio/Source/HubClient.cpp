@@ -457,9 +457,15 @@ void HubClient::getAuthStatus (AuthCallback cb)
         if (ok)
         {
             const juce::var parsed = juce::JSON::parse (text);
+            // Field order matters: the editor parses "account" up to
+            // ", oauthInProgress:" and "authError" as the tail, so
+            // authError MUST stay last (its message may contain
+            // commas from Google's error descriptions).
             detail = "provider: " + getStringField (parsed, "provider")
                    + ", authenticated: " + getStringField (parsed, "authenticated")
-                   + ", account: " + getStringField (parsed, "account");
+                   + ", account: " + getStringField (parsed, "account")
+                   + ", oauthInProgress: " + getStringField (parsed, "oauthInProgress")
+                   + ", authError: " + getStringField (parsed, "authError");
         }
         juce::MessageManager::callAsync ([cb = std::move (cb), token, ok, error, detail]() mutable
         {

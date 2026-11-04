@@ -288,6 +288,7 @@ public:
     // box — is what chooses the account. Disconnect is offered only
     // while connected.
     void setDriveConnected (bool connected, const juce::String& account = {});
+    void setConnectButtonText (const juce::String& text);
     void setDriveMessage (const juce::String& text);
     void resized() override;
 
@@ -428,6 +429,17 @@ private:
     void timerCallback() override;
     void checkHealth();
     void refreshDriveStatus();
+    // Auto-launch for the installed Hub (Windows installer build):
+    // when the default localhost Hub does not answer, start the
+    // installed onorab-hub.exe in Drive mode in the background, once
+    // per editor instance. JUCE ChildProcess launches with
+    // CREATE_NO_WINDOW on Windows, so no console window appears, and
+    // the child keeps running after FL closes, so reopening FL finds
+    // a Hub already running. Multiple plugin instances share the one
+    // Hub: the health check succeeds for the second instance, so it
+    // never launches another. Custom Hub URLs are never auto-
+    // launched (the user owns that Hub).
+    void tryLaunchInstalledHub();
     void refreshTransfers (bool silent);
     void refreshProjectsTab();
     void refreshLocalIds();
@@ -467,6 +479,14 @@ private:
     bool hubConnected = false;
     bool driveConnected = false;
     bool prevDriveConnected = false;
+    // Set while a browser sign-in is in flight (from Connect until
+    // the Hub confirms connected or reports a failure). While set,
+    // the timer polls auth status every 2 seconds so "Drive
+    // connected" (or the failure + "Try again") appears promptly
+    // instead of waiting for the 10-second poll.
+    bool authAwaiting = false;
+    // tryLaunchInstalledHub runs at most once per editor instance.
+    bool hubLaunchAttempted = false;
     float previewGain = 0.8f;
 
     // Header (always visible above the tabs).

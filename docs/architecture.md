@@ -219,17 +219,58 @@ shipped product and is replaced by this:
   another PC does NOT carry a sign-in: that PC signs in itself.
   After the first sign-in, reconnect is automatic: the Hub loads the
   refresh token and mints fresh access tokens without a browser.
-- **No secret in the repo, no secret in the binary.** For Desktop
-  apps with PKCE, the token exchange needs no client secret, so the
-  shipped binary contains only a client id — and even that id is NOT
-  in the repo: the release build injects it from a GitHub Actions
-  secret (`ONORAB_OAUTH_CLIENT_ID`) via
-  `-X main.buildOAuthClientID=...` (see the Build Hub step note in
+- **No secret in the repo; id + Desktop secret in the release binary
+  only.** The distributed Hub carries the SAME id + secret pair as
+  the Desktop OAuth JSON, both injected from GitHub Actions secrets
+  (`ONORAB_OAUTH_CLIENT_ID`, `ONORAB_OAUTH_CLIENT_SECRET`) via
+  `-X main.buildOAuthClientID=... -X main.buildOAuthClientSecret=...
+  -X main.buildDistribution=true` (see the Build Hub step note in
   the workflows; the Muse GitHub App cannot edit workflow files, so
-  the owner adds that flag + secret manually). Dev runs use
-  `ONORAB_OAUTH_CLIENT_ID` env or a Desktop OAuth JSON at
-  `ONORAB_CREDENTIALS_PATH` — dev only, never committed, never sent
-  in chat.
+  the owner adds those flags + secrets manually, plus a guard step
+  that fails the build when either secret is empty). Verified
+  2026-11-04: an id-only distributed build opened the browser and
+  Google approved, but the code exchange failed and /auth/status
+  stayed authenticated=false, while the same Hub launched with the
+  JSON's id + secret worked — so the pair must travel together, and
+  a distribution build with an id but no secret FAILS FAST at
+  startup instead of shipping silently broken. Why this is safe: for
+  Google Desktop (installed) apps the client secret is NOT a
+  confidential secret — it ships inside the app by design and grants
+  nothing on its own; it only works with a code the user approved in
+  their own browser, under PKCE S256 + state verification, for
+  drive.file only. What must truly stay private — each user's
+  refresh token — is never in the binary or the repo, only in that
+  PC's Credential Manager. No backend proxy is needed, because no
+  truly-private secret is distributed; if one ever were, THAT part
+  would move to a backend instead of into the exe. Dev runs use
+  `ONORAB_OAUTH_CLIENT_ID` (+ `ONORAB_OAUTH_CLIENT_SECRET`) env or a
+  Desktop OAuth JSON at `ONORAB_CREDENTIALS_PATH` — dev only, never
+  committed, never sent in chat.
+- **Installer + auto-launch (2026-11-04).**
+  `dist/windows/installer.nsi` (NSIS) installs Onorab.vst3 to
+  `Common Files\VST3` and onorab-hub.exe to `Program Files\Onorab`
+  (admin; uninstaller included; the CI step that runs makensis is
+  owner-added like the other workflow steps). On open, the plugin
+  checks the default localhost Hub; if it is not running, it
+  launches the installed Hub with `-provider drive` once (JUCE
+  ChildProcess launches with CREATE_NO_WINDOW, so no console
+  window; the child survives FL closing, so reopening FL finds a
+  Hub already running; multiple plugin instances share the one Hub
+  via the health check — a second instance never launches another).
+  The musician never touches PowerShell, JSON, env vars, or Google
+  Cloud Console. Because an auto-launched Hub has no console, its
+  logs also go to `%LOCALAPPDATA%\Onorab\hub.log`.
+- **Sign-in messages (2026-11-04).** The browser success page
+  appears ONLY after the code exchange AND the refresh-token store
+  both succeed; every failure (user cancel, refused exchange,
+  keychain store failure, timeout) writes an error page and is
+  reported by /auth/status as `authError`, which the plugin shows
+  with a "Try again" button. While a sign-in is in flight the plugin
+  shows "Waiting for Google…" and polls auth status every 2 seconds
+  instead of 10. A revoked/expired refresh token (`invalid_grant`)
+  is deleted from the keychain so a fresh Connect starts clean;
+  transient refresh failures keep the token. No page, message, or
+  log ever shows a token, code, or client secret.
 - **Testing-mode limits (until Production + verification):** only
   Test users (max 100, added in the OAuth consent screen) can sign
   in; every new user sees the "Google hasn't verified this app"
@@ -245,12 +286,12 @@ shipped product and is replaced by this:
   "Shared with me" view. The plugin's invite status says so; it does
   not promise instant cross-PC visibility.
 - **Still to do for a professional release (not in this batch):**
-  a real Windows installer (VST3 to `Common Files\VST3`, Hub
-  auto-start, uninstaller) instead of a raw ZIP; code signing so
-  Windows SmartScreen does not warn on install; a license-key
-  system if sales are per-seat; versioned auto-update for Hub +
-  VST; and crash/error reporting that never includes tokens or
-  audio content. None of these change the Drive model above.
+  code signing so Windows SmartScreen does not warn on install; a
+  license-key system if sales are per-seat; versioned auto-update
+  for Hub + VST; and crash/error reporting that never includes
+  tokens or audio content. The installer script exists
+  (`dist/windows/installer.nsi`); the CI step that builds it is
+  owner-added. None of these change the Drive model above.
 
 ### 3.4 Mobile <-> Drive
 

@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,28 +27,50 @@ import (
 // in an FL project, never sent to the plugin or to Muse.
 //
 // Client identity resolution (in order):
-//  1. ONORAB_OAUTH_CLIENT_ID environment variable (dev / manual runs).
-//  2. buildOAuthClientID, injected at release-build time by CI from a
-//     GitHub Actions secret (see docs/architecture.md §3.4). The repo
-//     itself contains NO client id and NO client secret.
+//  1. ONORAB_OAUTH_CLIENT_ID environment variable (dev / manual runs),
+//     with ONORAB_OAUTH_CLIENT_SECRET when one is configured.
+//  2. buildOAuthClientID + buildOAuthClientSecret, injected at
+//     release-build time by CI from GitHub Actions secrets (see
+//     docs/architecture.md §3.4). The repo itself contains NO client
+//     id and NO client secret. The id and the secret must always come
+//     from the SAME source: a distributed build that carries only an
+//     id (and silently drops the secret) fails exactly like the
+//     reported bug — browser opens, Google approves, but the code
+//     exchange fails and /auth/status stays authenticated=false.
+//     A distribution build (buildDistribution=true) therefore FAILS
+//     FAST at startup when its secret is missing, instead of
+//     pretending sign-in works.
 //  3. A Desktop OAuth JSON file at ONORAB_CREDENTIALS_PATH (dev only,
 //     e.g. the file downloaded from Google Cloud Console). This path
 //     is for the developer's own testing; shipped builds use (1)/(2).
 //
-// For Desktop (installed) apps with PKCE, the token exchange does not
-// require a client secret — that is the point of PKCE for apps that
-// cannot keep a secret. If a client secret IS configured (dev file),
-// it is sent too; shipped builds send client_id + PKCE only, so there
-// is no secret inside the distributed binary to extract.
+// Why a secret in the distributed binary is acceptable here: for
+// Google Desktop (installed) apps, the client secret is NOT treated
+// as a confidential secret — Google's model assumes it ships inside
+// the app, and the secret ALONE grants nothing: it only works
+// together with a code the user approved in their own browser, under
+// PKCE + state verification, for drive.file scope only. What must
+// truly stay private — each user's refresh token — is never in the
+// binary or the repo: it lives only in that PC's OS keychain. No
+// backend proxy is needed, because no truly-private secret is
+// distributed; if one ever were, THAT part would have to move to a
+// backend instead of into the exe.
 //
 // Scope is drive.file ONLY: the app sees files it created, plus files
 // explicitly shared with the signed-in user for Onorab projects —
 // never the user's whole Drive.
 
-// buildOAuthClientID is set by the release build:
-//   go build -ldflags "-X main.buildOAuthClientID=<client_id>"
-// It is empty in plain `go build` / `go test` runs.
+// buildOAuthClientID / buildOAuthClientSecret are set by the release
+// build:
+//   go build -ldflags "-X main.buildOAuthClientID=<id> -X main.buildOAuthClientSecret=<secret> -X main.buildDistribution=true"
+// They are empty in plain `go build` / `go test` runs.
+// buildDistribution is "true" only for the shipped build; a
+// distribution build with an id but no secret is a misconfiguration
+// and must fail fast (see resolveOAuthClient), never ship silently
+// broken.
 var buildOAuthClientID string
+var buildOAuthClientSecret string
+var buildDistribution string
 
 const (
 	googleAuthURL     = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -58,13 +81,25 @@ const (
 )
 
 // resolveOAuthClient returns (clientID, clientSecret, error) following
-// the precedence above. The secret is "" when only an id is configured.
+// the precedence above. The id and the secret always come as a pair
+// from ONE source: env, baked build values, or the JSON file. Mixing
+// sources (e.g. a baked id with a JSON secret) would pair a client
+// with another client's secret and fail the exchange with a confusing
+// error, so it is never done.
 func resolveOAuthClient(credentialsPath string) (string, string, error) {
 	if id := strings.TrimSpace(os.Getenv("ONORAB_OAUTH_CLIENT_ID")); id != "" {
 		return id, strings.TrimSpace(os.Getenv("ONORAB_OAUTH_CLIENT_SECRET")), nil
 	}
 	if id := strings.TrimSpace(buildOAuthClientID); id != "" {
-		return id, "", nil
+		secret := strings.TrimSpace(buildOAuthClientSecret)
+		if strings.EqualFold(strings.TrimSpace(buildDistribution), "true") && secret == "" {
+			return "", "", errors.New("distribution build is missing its OAuth client secret: " +
+				"build with -X main.buildOAuthClientSecret from the ONORAB_OAUTH_CLIENT_SECRET secret " +
+				"(and -X main.buildDistribution=true); a distribution build must carry the same " +
+				"client id + secret pair as the Desktop OAuth JSON, or the code exchange fails " +
+				"and sign-in silently stays unauthenticated")
+		}
+		return id, secret, nil
 	}
 	if credentialsPath != "" {
 		data, err := os.ReadFile(credentialsPath)
@@ -149,6 +184,16 @@ type DriveAuth struct {
 	// the user to type their Gmail again. Empty means "unknown", never
 	// "no account": Authenticated() is the source of truth for that.
 	account string
+	// lastAuthError is the last sign-in failure in plain words (user
+	// cancelled, Google refused the exchange, the OS keychain could
+	// not store the token, sign-in timed out), or "" when the last
+	// attempt succeeded or none ran. /auth/status reports it so the
+	// plugin can show a message + "Try again" instead of a silent
+	// authenticated=false. It never contains a token, code, or
+	// secret: only Google's error code/description and Hub-side
+	// messages. Cleared when a new attempt starts and when one
+	// succeeds; Disconnect clears it too.
+	lastAuthError string
 }
 
 func newDriveAuth(clientID, clientSecret string, store TokenStore) *DriveAuth {
@@ -176,6 +221,25 @@ func (a *DriveAuth) Account() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.account
+}
+
+// LastAuthError returns the last sign-in failure message, "" if none.
+func (a *DriveAuth) LastAuthError() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastAuthError
+}
+
+func (a *DriveAuth) setLastAuthError(msg string) {
+	a.mu.Lock()
+	a.lastAuthError = msg
+	a.mu.Unlock()
+}
+
+func (a *DriveAuth) clearLastAuthError() {
+	a.mu.Lock()
+	a.lastAuthError = ""
+	a.mu.Unlock()
 }
 
 // fetchAccount asks Google who the access token belongs to. It is
@@ -278,6 +342,7 @@ func (a *DriveAuth) Disconnect() {
 		_ = a.store.Delete("default")
 		_ = a.store.Delete("default:account")
 	}
+	a.clearLastAuthError()
 }
 
 // GetAccessToken returns a live access token, refreshing from the
@@ -308,6 +373,23 @@ func (a *DriveAuth) GetAccessToken() (string, error) {
 		"refresh_token": refresh,
 	})
 	if err != nil {
+		// A revoked/expired refresh token is permanent: keeping it
+		// would fail every call with the same error and leave the
+		// plugin stuck on "not connected" with no path forward.
+		// Delete it (token + stored account) so /auth/status is
+		// cleanly unauthenticated and a fresh Connect starts clean.
+		// Transient failures (network, Google 5xx) keep the token:
+		// only invalid_grant proves the grant itself is dead.
+		if strings.Contains(err.Error(), "invalid_grant") {
+			a.mu.Lock()
+			a.accessToken = ""
+			a.expiresAt = time.Time{}
+			a.account = ""
+			a.mu.Unlock()
+			_ = a.store.Delete("default")
+			_ = a.store.Delete("default:account")
+			return "", errors.New("Drive access was revoked or expired — sign in again via Settings → Connect Drive")
+		}
 		return "", err
 	}
 	if resp.RefreshToken != "" && a.store != nil {
@@ -324,8 +406,10 @@ func (a *DriveAuth) GetAccessToken() (string, error) {
 }
 
 // exchange posts one token request (code exchange or refresh) and
-// decodes the response. Client secret is included only when one is
-// configured (dev file); shipped PKCE builds omit it.
+// decodes the response. The client secret is included when one is
+// configured (distribution build, dev env, or dev JSON); a build with
+// an id but no secret sends id + PKCE only. Google's error text is
+// returned verbatim — it contains no tokens, codes, or secrets.
 func (a *DriveAuth) exchange(form map[string]string) (*tokenResponse, error) {
 	v := url.Values{}
 	for k, val := range form {
@@ -355,10 +439,20 @@ func (a *DriveAuth) exchange(form map[string]string) (*tokenResponse, error) {
 
 // startBrowserSession begins one sign-in: it opens a loopback listener,
 // builds the auth URL for the plugin to open in the user's browser,
-// and returns the URL. Completion happens asynchronously in
-// waitForCallback; the caller (handleAuthStart) returns the URL
-// immediately and must call oauth.Finish() exactly once when the
-// session ends (success, error, or timeout).
+// and returns the URL. Completion happens asynchronously on the done
+// channel; the caller (handleAuthStart) must call oauth.Finish()
+// exactly once when the session ends (success, error, or timeout).
+//
+// The browser success page is written ONLY after the code exchange
+// AND the refresh-token store both succeed, inside the redirect
+// handler itself. The previous version wrote "Onorab is connected"
+// the moment the code arrived and exchanged afterwards, so a failed
+// exchange still looked like a success in the browser while
+// /auth/status stayed authenticated=false. Every failure path now
+// writes an error page, records a plain-words message in
+// lastAuthError (reported by /auth/status for the plugin's
+// "Try again"), and sends the error on done. No page or message ever
+// echoes the code, a token, or the client secret.
 func (a *DriveAuth) startBrowserSession() (authURL string, done chan error, err error) {
 	verifier, challenge, err := pkcePair()
 	if err != nil {
@@ -377,37 +471,56 @@ func (a *DriveAuth) startBrowserSession() (authURL string, done chan error, err 
 	redirectURI := "http://" + ln.Addr().String() + "/"
 	authURL = buildAuthURL(a.clientID, redirectURI, state, challenge)
 
+	// A fresh attempt replaces any old failure report; a failure
+	// below sets a new one, success clears it.
+	a.clearLastAuthError()
 	done = make(chan error, 1)
 	go func() {
 		defer ln.Close()
-		codeCh := make(chan string, 1)
-		errCh := make(chan error, 1)
+		resultCh := make(chan error, 1)
+		// Exactly one redirect is processed per session: a second hit
+		// (browser refresh of the success page, double redirect) must
+		// never re-exchange an already-used code and overwrite the
+		// session result with a code-reuse error.
+		var handled atomic.Bool
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if !handled.CompareAndSwap(false, true) {
+				w.Header().Set("Content-Type", "text/html")
+				_, _ = w.Write([]byte("<html><body><h2>Onorab sign-in already finished.</h2>" +
+					"<p>Check FL Studio for the result.</p></body></html>"))
+				return
+			}
+			fail := func(status int, msg string, err error) {
+				http.Error(w, msg+". Close this tab and press Try again in FL Studio.", status)
+				a.setLastAuthError(msg)
+				resultCh <- err
+			}
 			if r.URL.Query().Get("state") != state {
-				http.Error(w, "state mismatch — this sign-in was not started by Onorab Hub", http.StatusBadRequest)
-				errCh <- errors.New("Google redirect state mismatch")
+				msg := "Google redirect state mismatch — this sign-in was not started by Onorab Hub"
+				fail(http.StatusBadRequest, msg, errors.New(msg))
 				return
 			}
 			if e := r.URL.Query().Get("error"); e != "" {
-				http.Error(w, "Google sign-in was not approved: "+e, http.StatusBadRequest)
-				errCh <- fmt.Errorf("Google sign-in error: %s", e)
+				// access_denied = the user pressed Cancel (or denied
+				// access) on Google's page. Any other error is shown
+				// as-is: Google's error codes contain no secrets.
+				msg := "Google sign-in error: " + e
+				if e == "access_denied" {
+					msg = "Google sign-in was cancelled"
+				}
+				fail(http.StatusBadRequest, msg, errors.New(msg))
 				return
 			}
 			code := r.URL.Query().Get("code")
 			if code == "" {
-				http.Error(w, "no authorization code in Google redirect", http.StatusBadRequest)
-				errCh <- errors.New("Google redirect had no authorization code")
+				msg := "Google redirect had no authorization code"
+				fail(http.StatusBadRequest, msg, errors.New(msg))
 				return
 			}
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = w.Write([]byte("<html><body><h2>Onorab is connected.</h2>" +
-				"<p>You can close this tab and return to FL Studio.</p></body></html>"))
-			codeCh <- code
-		})
-		go func() { _ = http.Serve(ln, mux) }()
-		select {
-		case code := <-codeCh:
+			// Exchange + store FIRST, success page ONLY after both
+			// succeed. The code itself is never echoed to the page
+			// or the logs.
 			tr, err := a.exchange(map[string]string{
 				"grant_type":    "authorization_code",
 				"code":          code,
@@ -415,16 +528,18 @@ func (a *DriveAuth) startBrowserSession() (authURL string, done chan error, err 
 				"code_verifier": verifier,
 			})
 			if err != nil {
-				done <- err
+				fail(http.StatusBadGateway, "Google sign-in could not be completed: "+err.Error(), err)
 				return
 			}
 			if tr.RefreshToken == "" {
-				done <- errors.New("Google did not return a refresh token — sign in again and approve access")
+				msg := "Google did not return a refresh token — sign in again and approve access"
+				fail(http.StatusBadGateway, msg, errors.New(msg))
 				return
 			}
 			if a.store != nil {
 				if err := a.store.Save("default", tr.RefreshToken); err != nil {
-					done <- fmt.Errorf("store refresh token in OS keychain: %w", err)
+					msg := "could not save the sign-in on this PC: " + err.Error()
+					fail(http.StatusInternalServerError, msg, errors.New(msg))
 					return
 				}
 			}
@@ -432,14 +547,25 @@ func (a *DriveAuth) startBrowserSession() (authURL string, done chan error, err 
 			a.accessToken = tr.AccessToken
 			a.expiresAt = time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second)
 			a.mu.Unlock()
-			// Remember WHO signed in, so Settings can show the account
-			// without ever asking the user to type their Gmail again.
-			a.tryFetchAccount(tr.AccessToken)
-			done <- nil
-		case err := <-errCh:
+			a.clearLastAuthError()
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<html><body><h2>Onorab is connected.</h2>" +
+				"<p>You can close this tab and return to FL Studio.</p></body></html>"))
+			// The account display fills in the background: a slow
+			// userinfo lookup must not delay the success page or
+			// the session result. The plugin polls /auth/status and
+			// shows the email as soon as it arrives.
+			go a.tryFetchAccount(tr.AccessToken)
+			resultCh <- nil
+		})
+		go func() { _ = http.Serve(ln, mux) }()
+		select {
+		case err := <-resultCh:
 			done <- err
 		case <-time.After(5 * time.Minute):
-			done <- errors.New("Google sign-in timed out after 5 minutes — press Connect Drive again")
+			msg := "Google sign-in timed out after 5 minutes — press Connect Drive again"
+			a.setLastAuthError(msg)
+			done <- errors.New(msg)
 		}
 	}()
 	return authURL, done, nil

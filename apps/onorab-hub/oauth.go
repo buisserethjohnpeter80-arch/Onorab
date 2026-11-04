@@ -109,6 +109,10 @@ func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
 		s.oauth.Finish()
 		if err == nil {
 			s.store.events.Broadcast(OnorabEvent{Type: "auth.connected", Timestamp: nowISO()})
+		} else {
+			// The error text contains no tokens, codes, or secrets
+			// (see startBrowserSession), so it is safe to broadcast.
+			s.store.events.Broadcast(OnorabEvent{Type: "auth.failed", Timestamp: nowISO(), Message: err.Error()})
 		}
 	}()
 	writeJSON(w, http.StatusOK, map[string]any{
