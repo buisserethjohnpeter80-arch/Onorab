@@ -280,8 +280,12 @@ func NewServer(cfg Config) (*Server, error) {
 		// Best-effort automatic reconnect: if this PC already has a
 		// stored refresh token, mint an access token now so the Hub
 		// starts authenticated. Failure here is NOT fatal — the user
-		// signs in via Settings → Connect Drive.
+		// signs in via Settings → Connect Drive. EnsureAccount also
+		// restores the connected-account display (from the persisted
+		// email, or one userinfo lookup), so reopening the plugin
+		// window never asks for sign-in again while a token exists.
 		_, _ = auth.GetAccessToken()
+		auth.EnsureAccount()
 	} else if cfg.Provider != "mock" && cfg.Provider != "" {
 		return nil, fmt.Errorf("unknown drive provider %q (use mock or drive)", cfg.Provider)
 	}
@@ -300,6 +304,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/events", s.handleEvents)
 	mux.HandleFunc("/auth/status", s.handleAuthStatus)
 	mux.HandleFunc("/auth/start", s.handleAuthStart)
+	mux.HandleFunc("/auth/disconnect", s.handleAuthDisconnect)
 	return cors(mux)
 }
 

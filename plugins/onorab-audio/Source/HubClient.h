@@ -112,11 +112,16 @@ public:
     // DELETE verb. Deleting the local cache copy is the editor's job.
     void deleteFile (const CloudFile& file, DeleteCallback cb);
     // Drive auth (Hub-side). getAuthStatus detail is
-    // "provider: <name>, authenticated: <0/1>". startAuth detail is
-    // the Google sign-in URL to open in the browser (empty in Mock
-    // mode, where it fails with oauth_unavailable instead).
+    // "provider: <name>, authenticated: <0/1>, account: <email>".
+    // The account is the Gmail the Hub learned from Google at sign-in
+    // (or "" when unknown); the plugin NEVER asks the user to type it.
+    // startAuth detail is the Google sign-in URL to open in the
+    // browser (empty in Mock mode, where it fails with
+    // oauth_unavailable instead). disconnectDrive signs out on this
+    // PC (Hub revokes + deletes the stored token and account).
     void getAuthStatus (AuthCallback cb);
     void startAuth (AuthCallback cb);
+    void disconnectDrive (DeleteCallback cb);
     // Project invite (Hub-side record; real Drive sharing is Phase 2).
     void sendInvite (const juce::String& email, const juce::String& project, InviteCallback cb);
 

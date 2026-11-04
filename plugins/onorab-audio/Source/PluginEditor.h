@@ -170,7 +170,6 @@ private:
     juce::ListBox fileList { "Library", this };
     juce::TextEditor searchBox;
     juce::TextButton refreshButton { "Refresh" };
-    juce::TextButton uploadButton { "Upload..." };
     juce::TextButton deleteButton { "Delete" };
     juce::Label messageLabel, errorLabel;
     juce::Label emptyLabel;
@@ -183,16 +182,18 @@ private:
     IconButton playerPlayButton;
     IconButton playerStopButton;
     juce::Slider gainSlider;
-
-    std::unique_ptr<juce::FileChooser> fileChooser;
 };
 
 // Projects tab: a project LIST (one row per real project found in the
 // Hub file list) and a project DETAIL view (the open project's sounds,
-// Add audio, Invite, Push, Delete). Projects come only from real
+// Auto-capture, Invite, Push, Delete). Projects come only from real
 // file.projectId values - never invented. FL Studio cannot list its
-// own project tracks automatically (a VST sees only its Mixer Track
-// audio), so local sounds enter a project only via Add audio or Push.
+// own Mixer Tracks or clips to a plugin (a VST sees only its own
+// Mixer Track audio), so sounds enter a project ONLY as audio routed
+// to this plugin's Mixer Track: press Capture from FL, or turn
+// Auto-capture on for the open project and play the routed tracks.
+// There is deliberately no laptop file picker here: the Mixer is the
+// source of project sounds.
 class ProjectsTab : public juce::Component,
                     public juce::ListBoxModel,
                     private juce::TextEditor::Listener
@@ -204,6 +205,9 @@ public:
     void setInviteStatus (const juce::String& text);
     std::vector<CloudFile> getDetailSelectedFiles() const;
     juce::String getOpenProject() const { return openProject; }
+    // Reflects whether auto-capture is currently running for the open
+    // project (the editor owns the state; the tab only displays it).
+    void setAutoCaptureState (bool on);
     void resized() override;
 
     // ListBoxModel: one model serves both lists (project list when no
@@ -230,7 +234,11 @@ private:
     juce::TextButton backButton { "< Projects" };
     juce::Label detailTitleLabel;
     juce::TextEditor detailSearchBox;
-    juce::TextButton addAudioButton { "Add audio" };
+    // Auto-capture for the open project: when on, audio routed to
+    // this plugin's Mixer Track is recorded in takes and uploaded to
+    // this project automatically (see the processor's auto mode).
+    juce::TextButton autoCaptureButton { "Auto-capture: Off" };
+    juce::Label busHintLabel;
     juce::TextButton inviteButton { "Invite" };
     juce::TextButton pushButton { "Push" };
     juce::TextButton deleteButton { "Delete" };
@@ -243,8 +251,6 @@ private:
     juce::TextButton inviteSendButton { "Send invite" };
     juce::TextButton inviteCancelButton { "Cancel" };
     bool invitePanelVisible = false;
-
-    std::unique_ptr<juce::FileChooser> fileChooser;
 };
 
 class TransfersTab : public juce::Component,
@@ -275,7 +281,13 @@ public:
     explicit SettingsTab (OnorabAudioProcessorEditor& editor);
     void setValues (const juce::String& hubUrl, const juce::String& cacheDir);
     void setStatus (const juce::String& text);
-    void setDriveConnected (bool connected);
+    // Connected state comes only from the Hub (/auth/status, polled
+    // by the editor). `account` is the Gmail the Hub learned from
+    // Google at sign-in; it is shown, never typed: there is NO email
+    // field in this panel, because the browser sign-in — not a text
+    // box — is what chooses the account. Disconnect is offered only
+    // while connected.
+    void setDriveConnected (bool connected, const juce::String& account = {});
     void setDriveMessage (const juce::String& text);
     void resized() override;
 
@@ -291,10 +303,12 @@ private:
     // Windows Credential Manager on this PC only). "Drive connected"
     // is shown only after the Hub confirms authentication (the editor
     // polls the Hub status); it is never assumed from the button press.
-    juce::Label driveTitleLabel, driveStatusLabel, driveMessageLabel;
+    // The token persists in the OS keychain, so closing or minimizing
+    // the plugin window never asks for sign-in again while it exists.
+    juce::Label driveTitleLabel, driveStatusLabel, driveMessageLabel, driveAccountLabel;
     StatusDot driveDot;
-    juce::TextEditor driveEmailBox;
     juce::TextButton connectDriveButton { "Connect Google Drive" };
+    juce::TextButton disconnectDriveButton { "Disconnect" };
     // Advanced section (collapsed by default): Hub URL + cache folder.
     juce::TextButton advancedButton { "Advanced" };
     bool advancedVisible = false;
@@ -367,7 +381,17 @@ public:
     void uploadFilesToProject (const std::vector<juce::File>& files, const juce::String& project);
     void pushProjectFiles (const std::vector<CloudFile>& files, const juce::String& project);
     void retryTransfer (int entry);
-    void connectDrive (const juce::String& email);
+    // Drive sign-in (no email argument: the browser sign-in chooses
+    // the account; the Hub reports it back for display). Disconnect
+    // signs out on this PC via the Hub.
+    void connectDrive();
+    void disconnectDrive();
+    // Auto-capture for one project: toggles recording of routed Mixer
+    // audio into that project (see the processor's auto mode). Only
+    // one project can auto-capture at a time: enabling another stops
+    // the first. Empty while off.
+    void toggleProjectAutoCapture (const juce::String& project);
+    juce::String getAutoCaptureProject() const { return autoCaptureProject; }
     void inviteToProject (const juce::String& email, const juce::String& project);
     void playPreview();
     void pausePreview();
@@ -457,6 +481,11 @@ private:
     juce::File captureReviewFile;
     juce::File captureUploadTarget;
     std::function<void (bool, juce::String)> captureUploadHook;
+
+    // Project currently auto-capturing routed Mixer audio (empty = off).
+    // Owned by the editor; the processor only knows the target while
+    // its auto writer runs.
+    juce::String autoCaptureProject;
 
     // Tab components are owned by the TabbedComponent; these raw pointers
     // are only used while the editor is alive (the tabs die with it).

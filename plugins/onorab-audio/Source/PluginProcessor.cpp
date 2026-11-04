@@ -171,6 +171,227 @@ void OnorabAudioProcessor::stopCapture()
         captureWriterThread.join();
 }
 
+bool OnorabAudioProcessor::startAutoCapture (const juce::String& project)
+{
+    if (isCapturing())
+        return false;
+
+    const int channels = juce::jlimit (1, 2, lastNumChannels.load());
+    const double sampleRate = getSampleRate() > 0.0 ? getSampleRate() : 48000.0;
+
+    droppedSamples.store (0);
+    capturedSamples.store (0);
+    captureFifo.reset();
+    // Auto takes use the finished-take queue, never the manual
+    // finished callback (which would open the review panel).
+    captureFinishedCallback = nullptr;
+    lastCaptureFile = {};
+    autoMode = true;
+    autoProject = project;
+
+    // A previous writer thread object may still be joinable here even
+    // though no capture is running (the auto writer exits on its own
+    // after a fatal file error). Assigning a new std::thread to a
+    // joinable one terminates the process, so join it first: the old
+    // thread has already finished (or is just returning), so this
+    // join cannot block on live audio work.
+    if (captureWriterThread.joinable())
+        captureWriterThread.join();
+
+    // Launch the writer FIRST, then arm the flag, so no audio block can
+    // arrive before the writer exists to drain it (same order as manual).
+    captureWriterThread = std::thread ([this, channels, sampleRate]
+    {
+        captureWriterLoopAuto (channels, sampleRate);
+    });
+    capturing.store (true, std::memory_order_release);
+    return true;
+}
+
+void OnorabAudioProcessor::stopAutoCapture()
+{
+    if (! autoMode && ! isCapturing())
+        return;
+    autoMode = false;
+    // Shared stop: disarms + joins the writer, which finalizes the
+    // open take into the finished queue before it exits.
+    stopCapture();
+}
+
+std::vector<OnorabAudioProcessor::AutoTake> OnorabAudioProcessor::takeFinishedAutoTakes()
+{
+    std::lock_guard<std::mutex> lock (autoTakesMutex);
+    std::vector<AutoTake> out;
+    out.swap (finishedAutoTakes);
+    return out;
+}
+
+void OnorabAudioProcessor::captureWriterLoopAuto (int numChannels, double sampleRate)
+{
+    // Writer thread ONLY. See the header for the take-splitting rules.
+    // A take is any continuous burst of routed audio; silence between
+    // bursts splits takes, and a 10-minute take splits on length.
+    constexpr float kSignalThreshold = 0.001f; // ~-60 dBFS peak
+    constexpr double kSilenceTimeoutSeconds = 2.0;
+    constexpr double kMaxTakeSeconds = 600.0;
+    const int64_t silenceTimeoutFrames = static_cast<int64_t> (kSilenceTimeoutSeconds * sampleRate);
+    const int64_t maxTakeFrames = static_cast<int64_t> (kMaxTakeSeconds * sampleRate);
+
+    if (! cacheDir.exists() && ! cacheDir.createDirectory())
+    {
+        DBG ("Onorab auto-capture failed: could not create the cache folder: "
+             << cacheDir.getFullPathName());
+        capturing.store (false, std::memory_order_release);
+        return;
+    }
+
+    juce::WavAudioFormat wavFormat;
+    std::unique_ptr<juce::AudioFormatWriter> writer;
+    juce::File takeFile;
+    int64_t takeFrames = 0;
+    int64_t silenceFrames = 0;
+    bool takeOpen = false;
+    int takeIndex = 0;
+    bool fatalError = false;
+
+    auto closeTake = [&]()
+    {
+        if (! takeOpen)
+            return;
+        if (writer != nullptr)
+        {
+            writer->flush();
+            writer.reset(); // closes the file
+        }
+        // Only a file that really exists on disk may be queued: a
+        // failed writer must never hand the editor a phantom take.
+        if (takeFrames > 0 && takeFile.existsAsFile())
+        {
+            std::lock_guard<std::mutex> lock (autoTakesMutex);
+            finishedAutoTakes.push_back ({ takeFile, autoProject });
+        }
+        else
+        {
+            takeFile.deleteFile();
+        }
+        takeOpen = false;
+        takeFrames = 0;
+        silenceFrames = 0;
+    };
+
+    auto openTake = [&]() -> bool
+    {
+        // Milliseconds + a per-run index: two takes can never share a
+        // name, so a new take can never truncate a queued one.
+        const juce::String name = "bus-capture-"
+            + juce::String (juce::Time::getCurrentTime().toMilliseconds())
+            + "-" + juce::String (++takeIndex) + ".wav";
+        takeFile = cacheDir.getChildFile (HubClient::sanitiseFileName (name));
+        std::unique_ptr<juce::FileOutputStream> newStream (takeFile.createOutputStream());
+        if (newStream == nullptr)
+            return false;
+        std::unique_ptr<juce::AudioFormatWriter> newWriter (
+            wavFormat.createWriterFor (newStream.get(), sampleRate,
+                                       static_cast<unsigned int> (numChannels),
+                                       16, {}, 0));
+        if (newWriter == nullptr)
+        {
+            // The stream created an empty file; remove it so a failed
+            // take never litters the cache with zero-byte files.
+            takeFile.deleteFile();
+            return false;
+        }
+        newStream.release(); // owned by the writer now
+        writer = std::move (newWriter);
+        takeOpen = true;
+        takeFrames = 0;
+        silenceFrames = 0;
+        return true;
+    };
+
+    constexpr int kChunkFrames = 4096;
+    juce::AudioBuffer<float> chunk (numChannels, kChunkFrames);
+    std::vector<float> interleaved (static_cast<size_t> (kChunkFrames)
+                                    * static_cast<size_t> (numChannels));
+
+    while (capturing.load (std::memory_order_acquire) || captureFifo.getNumReady() > 0)
+    {
+        const int readySamples = captureFifo.getNumReady();
+        if (readySamples < numChannels)
+        {
+            // A partial frame can never complete once capture stopped;
+            // drop it instead of sleeping forever on a drained FIFO.
+            if (! capturing.load (std::memory_order_acquire))
+                break;
+            // Nothing complete to write yet; poll briefly. (Polling
+            // here is fine: this is the writer thread, not the audio
+            // thread, and it never blocks the RT side.)
+            std::this_thread::sleep_for (std::chrono::milliseconds (5));
+            continue;
+        }
+        const int framesAvailable = readySamples / numChannels;
+        const int framesToWrite = juce::jmin (kChunkFrames, framesAvailable);
+        const int read = captureFifo.read (interleaved.data(), framesToWrite * numChannels);
+        const int framesRead = read / numChannels;
+        if (framesRead <= 0)
+            continue;
+
+        // Peak of this chunk (writer thread: cheap, no RT impact).
+        float peak = 0.0f;
+        for (int i = 0; i < framesRead * numChannels; ++i)
+        {
+            const float s = interleaved[static_cast<size_t> (i)];
+            peak = juce::jmax (peak, s < 0.0f ? -s : s);
+        }
+        const bool signal = peak >= kSignalThreshold;
+
+        if (! takeOpen)
+        {
+            if (! signal)
+                continue; // leading silence: dropped, never an empty take
+            if (! openTake())
+            {
+                DBG ("Onorab auto-capture failed: could not create a take file in: "
+                     << cacheDir.getFullPathName());
+                fatalError = true;
+                break;
+            }
+        }
+
+        // De-interleave into the JUCE buffer for the writer.
+        for (int ch = 0; ch < numChannels; ++ch)
+            for (int frame = 0; frame < framesRead; ++frame)
+                chunk.setSample (ch, frame,
+                                 interleaved[static_cast<size_t> (frame)
+                                             * static_cast<size_t> (numChannels)
+                                             + static_cast<size_t> (ch)]);
+
+        if (! writer->writeFromAudioSampleBuffer (chunk, 0, framesRead))
+        {
+            DBG ("Onorab auto-capture failed while writing a take file.");
+            fatalError = true;
+            break;
+        }
+        capturedSamples.fetch_add (framesRead);
+        takeFrames += framesRead;
+        if (signal)
+            silenceFrames = 0;
+        else
+            silenceFrames += framesRead;
+
+        if (takeFrames >= maxTakeFrames)
+            closeTake(); // long take splits; the next signal chunk opens a new one
+        else if (silenceFrames >= silenceTimeoutFrames)
+            closeTake();
+    }
+
+    // Finalize any open take on stop (the drain path above already
+    // wrote the trailing audio into it).
+    closeTake();
+    if (fatalError)
+        capturing.store (false, std::memory_order_release);
+}
+
 void OnorabAudioProcessor::captureWriterLoop (juce::File outFile, int numChannels, double sampleRate)
 {
     // Writer thread ONLY. This is the one place captured audio is written.

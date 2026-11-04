@@ -117,6 +117,28 @@ func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleAuthDisconnect signs the user out on this PC: the Hub revokes
+// the refresh token at Google (best-effort) and deletes the token and
+// the stored account from the OS keychain. After this /auth/status
+// reports authenticated=false again, and the plugin shows the Connect
+// button — never a stale account. In Mock mode there is nothing to
+// disconnect, reported honestly.
+func (s *Server) handleAuthDisconnect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "invalid_request", "method %s not allowed on /auth/disconnect", r.Method)
+		return
+	}
+	if s.driveAuth == nil {
+		writeError(w, http.StatusNotImplemented, "oauth_unavailable",
+			"Google OAuth is not available in Mock mode. "+
+				"Start the Hub with ONORAB_DRIVE_PROVIDER=drive to use real Drive sign-in.")
+		return
+	}
+	s.driveAuth.Disconnect()
+	s.store.events.Broadcast(OnorabEvent{Type: "auth.disconnected", Timestamp: nowISO()})
+	writeJSON(w, http.StatusOK, map[string]any{"disconnected": true})
+}
+
 // TokenStore is the Phase 2 storage boundary. Phase 1 has no tokens, so
 // no implementation is exercised; the interface exists so Phase 2 does
 // not invent a file-based token store under time pressure.

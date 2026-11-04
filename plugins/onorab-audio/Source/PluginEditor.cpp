@@ -393,21 +393,11 @@ LibraryTab::LibraryTab (OnorabAudioProcessorEditor& editorIn)
     refreshButton.onClick = [this] { owner.refreshFiles(); };
     addAndMakeVisible (refreshButton);
 
-    styleButton (uploadButton, kPurple);
-    uploadButton.onClick = [this]
-    {
-        fileChooser = std::make_unique<juce::FileChooser> ("Choose an audio file to upload",
-                                                           juce::File(), "*.wav;*.mp3;*.flac;*.aiff;*.ogg;*.m4a");
-        fileChooser->launchAsync (juce::FileBrowserComponent::openMode
-                                      | juce::FileBrowserComponent::canSelectFiles,
-                                  [this] (const juce::FileChooser& chooser)
-                                  {
-                                      if (const juce::File f = chooser.getResult(); f.existsAsFile())
-                                          owner.uploadLocalFile (f);
-                                  });
-    };
-    addAndMakeVisible (uploadButton);
-
+    // No laptop file picker here by design (2026-11-04): sounds reach
+    // the Library from the phone via Drive, or from FL Studio via
+    // Capture from FL / project Auto-capture — never from a local
+    // file chooser. (The editor's uploadLocalFile helpers stay for
+    // those flows; only the picker button is gone.)
     styleButton (deleteButton, kRed);
     deleteButton.onClick = [this]
     {
@@ -591,11 +581,9 @@ void LibraryTab::resized()
 {
     auto area = getLocalBounds().reduced (12);
     auto topRow = area.removeFromTop (30);
-    searchBox.setBounds (topRow.removeFromLeft (topRow.getWidth() - 220));
+    searchBox.setBounds (topRow.removeFromLeft (topRow.getWidth() - 106));
     topRow.removeFromLeft (8);
     refreshButton.setBounds (topRow.removeFromLeft (90));
-    topRow.removeFromLeft (8);
-    uploadButton.setBounds (topRow.removeFromLeft (110));
     area.removeFromTop (6);
     auto actionRow = area.removeFromTop (28);
     deleteButton.setBounds (actionRow.removeFromLeft (110));
@@ -713,24 +701,19 @@ ProjectsTab::ProjectsTab (OnorabAudioProcessorEditor& editorIn)
     detailList.setMultipleSelectionEnabled (true); // Push / Delete one or more sounds.
     addAndMakeVisible (detailList);
 
-    stylePrimaryButton (addAudioButton);
-    addAudioButton.onClick = [this]
-    {
-        fileChooser = std::make_unique<juce::FileChooser> ("Choose audio files to add to this project",
-                                                           juce::File(), "*.wav;*.mp3;*.flac;*.aiff;*.ogg;*.m4a");
-        fileChooser->launchAsync (juce::FileBrowserComponent::openMode
-                                      | juce::FileBrowserComponent::canSelectFiles
-                                      | juce::FileBrowserComponent::canSelectMultipleItems,
-                                  [this] (const juce::FileChooser& chooser)
-                                  {
-                                      std::vector<juce::File> picked;
-                                      for (const auto& f : chooser.getResults())
-                                          if (f.existsAsFile())
-                                              picked.push_back (f);
-                                      owner.uploadFilesToProject (picked, openProject);
-                                  });
-    };
-    addAndMakeVisible (addAudioButton);
+    // No laptop file picker here by design (2026-11-04): a project's
+    // sounds come from audio routed to this plugin's Mixer Track.
+    // Auto-capture records that audio into this project in takes;
+    // the header's Capture from FL does the same manually.
+    stylePrimaryButton (autoCaptureButton);
+    autoCaptureButton.onClick = [this] { owner.toggleProjectAutoCapture (openProject); };
+    addAndMakeVisible (autoCaptureButton);
+    styleLabel (busHintLabel, kTextDim, 12.0f);
+    busHintLabel.setText ("Route a Mixer Track to this plugin's Mixer Track, then turn "
+                          "Auto-capture on: every take played through it is recorded "
+                          "and uploaded to this project automatically.",
+                          juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (busHintLabel);
     styleButton (inviteButton, kPurple);
     inviteButton.onClick = [this]
     {
@@ -820,7 +803,10 @@ void ProjectsTab::updateView()
     detailTitleLabel.setVisible (detail);
     detailSearchBox.setVisible (detail);
     detailList.setVisible (detail);
-    addAudioButton.setVisible (detail);
+    autoCaptureButton.setVisible (detail);
+    busHintLabel.setVisible (detail);
+    if (detail)
+        setAutoCaptureState (owner.getAutoCaptureProject() == openProject);
     inviteButton.setVisible (detail);
     pushButton.setVisible (detail);
     deleteButton.setVisible (detail);
@@ -835,6 +821,11 @@ void ProjectsTab::updateView()
         applyDetailFilter();
     }
     resized();
+}
+
+void ProjectsTab::setAutoCaptureState (bool on)
+{
+    autoCaptureButton.setButtonText (on ? "Auto-capture: On" : "Auto-capture: Off");
 }
 
 void ProjectsTab::setStatus (const juce::String& text, bool isError)
@@ -945,13 +936,15 @@ void ProjectsTab::resized()
     detailSearchBox.setBounds (area.removeFromTop (28));
     area.removeFromTop (6);
     auto buttonRow = area.removeFromTop (30);
-    addAudioButton.setBounds (buttonRow.removeFromLeft (120));
+    autoCaptureButton.setBounds (buttonRow.removeFromLeft (150));
     buttonRow.removeFromLeft (6);
     inviteButton.setBounds (buttonRow.removeFromLeft (90));
     buttonRow.removeFromLeft (6);
     pushButton.setBounds (buttonRow.removeFromLeft (90));
     buttonRow.removeFromLeft (6);
     deleteButton.setBounds (buttonRow.removeFromLeft (110));
+    area.removeFromTop (6);
+    busHintLabel.setBounds (area.removeFromTop (18));
     area.removeFromTop (6);
     if (invitePanelVisible)
     {
@@ -1051,11 +1044,22 @@ SettingsTab::SettingsTab (OnorabAudioProcessorEditor& editorIn)
     styleLabel (driveStatusLabel, kTextDim, 13.0f);
     driveStatusLabel.setText ("Not connected", juce::NotificationType::dontSendNotification);
     addAndMakeVisible (driveStatusLabel);
-    styleTextBox (driveEmailBox, "Gmail, e.g. you@gmail.com");
-    addAndMakeVisible (driveEmailBox);
+    // No email field here by design (2026-11-04): the account is
+    // chosen in the browser at sign-in and reported back by the Hub,
+    // so the user never types their Gmail into the plugin — and never
+    // re-types it when the window reopens, because the Hub's stored
+    // token restores the connection on its own.
+    styleLabel (driveAccountLabel, kTextDim, 13.0f);
+    addAndMakeVisible (driveAccountLabel);
     stylePrimaryButton (connectDriveButton);
-    connectDriveButton.onClick = [this] { owner.connectDrive (driveEmailBox.getText().trim()); };
+    connectDriveButton.onClick = [this] { owner.connectDrive(); };
     addAndMakeVisible (connectDriveButton);
+    styleButton (disconnectDriveButton, kRed);
+    disconnectDriveButton.onClick = [this] { owner.disconnectDrive(); };
+    // Hidden until the first Hub status poll confirms a connection
+    // (setDriveConnected owns visibility after that).
+    disconnectDriveButton.setVisible (false);
+    addAndMakeVisible (disconnectDriveButton);
     styleLabel (driveMessageLabel, kTextDim, 12.0f);
     addAndMakeVisible (driveMessageLabel);
 
@@ -1138,12 +1142,22 @@ void SettingsTab::setStatus (const juce::String& text)
     savedLabel.setText (text, juce::NotificationType::dontSendNotification);
 }
 
-void SettingsTab::setDriveConnected (bool connected)
+void SettingsTab::setDriveConnected (bool connected, const juce::String& account)
 {
     driveDot.setDotColour (connected ? kGreen : kGrey);
     driveStatusLabel.setText (connected ? "Drive connected" : "Not connected",
                               juce::NotificationType::dontSendNotification);
     driveStatusLabel.setColour (juce::Label::textColourId, connected ? kGreen : kTextDim);
+    // The connected account is DISPLAYED from the Hub's report; an
+    // unknown account still shows "Drive connected" (the connection
+    // itself is the fact that matters, not the email string).
+    driveAccountLabel.setText (connected
+                                   ? (account.isNotEmpty() ? ("Connected as " + account)
+                                                          : "Connected - account details unavailable")
+                                   : "",
+                               juce::NotificationType::dontSendNotification);
+    connectDriveButton.setVisible (! connected);
+    disconnectDriveButton.setVisible (connected);
 }
 
 void SettingsTab::setDriveMessage (const juce::String& text)
@@ -1160,10 +1174,12 @@ void SettingsTab::resized()
     driveDot.setBounds (statusRow.removeFromLeft (22));
     driveStatusLabel.setBounds (statusRow);
     area.removeFromTop (6);
-    driveEmailBox.setBounds (area.removeFromTop (28));
+    driveAccountLabel.setBounds (area.removeFromTop (20));
     area.removeFromTop (6);
     auto connectRow = area.removeFromTop (30);
     connectDriveButton.setBounds (connectRow.removeFromLeft (200));
+    connectRow.removeFromLeft (8);
+    disconnectDriveButton.setBounds (connectRow.removeFromLeft (140));
     area.removeFromTop (4);
     driveMessageLabel.setBounds (area.removeFromTop (18));
     area.removeFromTop (10);
@@ -1304,6 +1320,15 @@ OnorabAudioProcessorEditor::OnorabAudioProcessorEditor (OnorabAudioProcessor& pr
     stylePrimaryButton (captureButton);
     captureButton.onClick = [this]
     {
+        // Auto-capture owns the capture writer while it runs: the
+        // header Stop must never silently kill it. The user turns
+        // auto-capture off in the Projects detail view instead.
+        if (autoCaptureProject.isNotEmpty())
+        {
+            setError ("Auto-capture is on for project " + autoCaptureProject
+                      + " - turn it off in Projects before using Capture from FL.");
+            return;
+        }
         if (audioProcessor.isCapturing())
             stopCapture();
         else
@@ -1347,7 +1372,13 @@ OnorabAudioProcessorEditor::~OnorabAudioProcessorEditor()
     // before any member is destroyed.
     aliveToken->store (false);
     stopTimer();
-    if (audioProcessor.isCapturing())
+    // Auto-capture owns the same writer thread as manual capture, so
+    // stopping it here (before members die) also finalizes its open
+    // take. Finished-but-unuploaded takes stay queued in the
+    // processor and upload when the editor reopens.
+    if (autoCaptureProject.isNotEmpty())
+        audioProcessor.stopAutoCapture();
+    else if (audioProcessor.isCapturing())
         audioProcessor.stopCapture();
     transport.stop();
     transport.setSource (nullptr);
@@ -1420,8 +1451,38 @@ void OnorabAudioProcessorEditor::filesDropped (const juce::StringArray& files, i
 void OnorabAudioProcessorEditor::timerCallback()
 {
     ++timerTicks;
+    // Auto-capture: finished takes (recorded from routed Mixer audio)
+    // upload to their project here, on the message thread, one second
+    // after each take ends. The processor only records; the editor
+    // owns every upload, so Transfers shows them like any upload.
+    // Takes are drained FIRST, so a take that finished just as the
+    // writer died still uploads instead of being orphaned.
+    if (autoCaptureProject.isNotEmpty())
+    {
+        for (const auto& take : audioProcessor.takeFinishedAutoTakes())
+            uploadLocalFileInternal (take.file, take.project, -1);
+        if (! audioProcessor.isCapturing())
+        {
+            // The auto writer died (e.g. it could not create a take
+            // file): join its thread object here (a dead-but-unjoined
+            // thread must never linger) and never leave the toggle
+            // stuck on.
+            audioProcessor.stopAutoCapture();
+            setError ("Auto-capture stopped unexpectedly for project " + autoCaptureProject
+                      + " - turn it on again in Projects to resume.");
+            autoCaptureProject.clear();
+            if (projectsTab != nullptr)
+                projectsTab->setAutoCaptureState (false);
+            captureButton.setButtonText ("Capture from FL");
+        }
+        else
+        {
+            captureButton.setButtonText ("Auto-capture on");
+            captureCounterLabel.setText ("", juce::NotificationType::dontSendNotification);
+        }
+    }
     // Capture counter + player position update every second.
-    if (audioProcessor.isCapturing())
+    if (audioProcessor.isCapturing() && autoCaptureProject.isEmpty())
     {
         const int elapsed = static_cast<int> ((juce::Time::getCurrentTime() - captureStartTime).inSeconds());
         captureCounterLabel.setText (formatDuration (static_cast<double> (elapsed)),
@@ -1854,17 +1915,17 @@ void OnorabAudioProcessorEditor::retryTransfer (int entry)
         retry (entry);
 }
 
-void OnorabAudioProcessorEditor::connectDrive (const juce::String& email)
+void OnorabAudioProcessorEditor::connectDrive()
 {
     if (settingsTab == nullptr)
         return;
-    if (email.isEmpty() || ! email.containsChar ('@'))
-    {
-        settingsTab->setDriveMessage ("Enter a Gmail address first (it must contain '@').");
-        return;
-    }
-    settingsTab->setDriveMessage ("Checking Hub Drive status for " + email + "...");
-    hub.getAuthStatus ([this, email] (bool ok, juce::String error, juce::String detail)
+    // No email is asked here, ever: the account is chosen in the
+    // browser at Google sign-in, and the Hub reports it back for
+    // display (refreshDriveStatus). Asking for a typed Gmail only
+    // confused the flow, because the typed address never selected
+    // anything — the browser account always did.
+    settingsTab->setDriveMessage ("Checking Hub Drive status...");
+    hub.getAuthStatus ([this] (bool ok, juce::String error, juce::String detail)
     {
         if (settingsTab == nullptr)
             return;
@@ -1875,7 +1936,7 @@ void OnorabAudioProcessorEditor::connectDrive (const juce::String& email)
         }
         if (detail.contains ("authenticated: 1") || detail.contains ("authenticated: true"))
         {
-            settingsTab->setDriveMessage ("Drive connected (" + detail + ").");
+            settingsTab->setDriveMessage ("Drive connected.");
             refreshDriveStatus();
             return;
         }
@@ -1886,8 +1947,11 @@ void OnorabAudioProcessorEditor::connectDrive (const juce::String& email)
         // reported honestly, not faked into a login. Commercial note:
         // every PC signs in with its OWN Gmail; the token stays on
         // that PC's Credential Manager, so a buyer never uses the
-        // seller's Google account.
-        hub.startAuth ([this, email] (bool authOk, juce::String authError, juce::String authUrl)
+        // seller's Google account. One completed sign-in persists
+        // across Hub restarts and plugin window reopens; only Google's
+        // Testing-mode 7-day refresh-token expiry (until the app is
+        // verified / Production) can ask for sign-in again.
+        hub.startAuth ([this] (bool authOk, juce::String authError, juce::String authUrl)
         {
             if (settingsTab == nullptr)
                 return;
@@ -1899,7 +1963,7 @@ void OnorabAudioProcessorEditor::connectDrive (const juce::String& email)
             else if (authOk && authUrl.startsWith ("https://"))
             {
                 juce::URL (authUrl).launchInDefaultBrowser();
-                settingsTab->setDriveMessage ("Browser opened - sign in with YOUR Gmail (" + email + "), "
+                settingsTab->setDriveMessage ("Browser opened - sign in with your Google account and "
                                               "approve drive.file access, then wait: this panel shows "
                                               "\"Drive connected\" once the Hub confirms it. "
                                               "Your token stays on this PC only.");
@@ -1914,6 +1978,73 @@ void OnorabAudioProcessorEditor::connectDrive (const juce::String& email)
             }
         });
     });
+}
+
+void OnorabAudioProcessorEditor::disconnectDrive()
+{
+    if (settingsTab == nullptr)
+        return;
+    settingsTab->setDriveMessage ("Disconnecting Drive on this PC...");
+    hub.disconnectDrive ([this] (bool ok, juce::String error)
+    {
+        if (settingsTab == nullptr)
+            return;
+        if (ok)
+        {
+            settingsTab->setDriveMessage ("Drive disconnected on this PC.");
+            refreshDriveStatus();
+        }
+        else
+        {
+            settingsTab->setDriveMessage ("Drive disconnect failed: " + error);
+        }
+    });
+}
+
+void OnorabAudioProcessorEditor::toggleProjectAutoCapture (const juce::String& project)
+{
+    if (project.isEmpty())
+    {
+        setError ("Open a project first - auto-capture records into the open project.");
+        return;
+    }
+    if (autoCaptureProject == project)
+    {
+        // Turning off: the writer finalizes the open take (if any) and
+        // the timer uploads it on the next tick, like any finished take.
+        audioProcessor.stopAutoCapture();
+        autoCaptureProject.clear();
+        if (projectsTab != nullptr)
+            projectsTab->setAutoCaptureState (false);
+        captureButton.setButtonText ("Capture from FL");
+        setProgress ("Auto-capture off for project " + project + ".");
+        return;
+    }
+    if (audioProcessor.isCapturing())
+    {
+        // Either manual Capture is running, or another project's auto
+        // mode is. Manual capture must be stopped by its own Stop
+        // button first; another project's auto mode is stopped below.
+        if (autoCaptureProject.isEmpty())
+        {
+            setError ("Stop Capture from FL first, then turn auto-capture on.");
+            return;
+        }
+        audioProcessor.stopAutoCapture();
+        autoCaptureProject.clear();
+    }
+    if (! audioProcessor.startAutoCapture (project))
+    {
+        setError ("Could not start auto-capture for project " + project + ".");
+        if (projectsTab != nullptr)
+            projectsTab->setAutoCaptureState (false);
+        return;
+    }
+    autoCaptureProject = project;
+    if (projectsTab != nullptr)
+        projectsTab->setAutoCaptureState (true);
+    setProgress ("Auto-capture on for project " + project
+                 + " - audio routed to this Mixer Track will appear in this project.");
 }
 
 void OnorabAudioProcessorEditor::inviteToProject (const juce::String& email, const juce::String& project)
@@ -2041,6 +2172,15 @@ void OnorabAudioProcessorEditor::setCaptureUI (bool capturing)
 
 void OnorabAudioProcessorEditor::startCapture()
 {
+    // Central guard (covers the header button AND the Library empty
+    // state button): auto-capture owns the capture writer while it
+    // runs, so a manual capture must never steal it.
+    if (autoCaptureProject.isNotEmpty())
+    {
+        setError ("Auto-capture is on for project " + autoCaptureProject
+                  + " - turn it off in Projects before using Capture from FL.");
+        return;
+    }
     if (audioProcessor.isCapturing())
         return;
     const auto now = juce::Time::getCurrentTime();
@@ -2132,13 +2272,21 @@ void OnorabAudioProcessorEditor::sendCaptureToDrive (const juce::String& name)
             captureReview->setStatus ("Upload failed: " + error, true);
         }
     };
-    uploadLocalFileInternal (target, {}, -1);
+    // Destination: the open project wins (the routed track's audio
+    // belongs to the project the user is looking at); otherwise the
+    // general Library. This is what makes a manual capture land in a
+    // project without any file picker.
+    const juce::String project = projectsTab != nullptr ? projectsTab->getOpenProject() : juce::String {};
+    captureReview->setStatus ("Sending to " + (project.isEmpty() ? juce::String ("Library")
+                                                                : ("project " + project)) + "...", false);
+    uploadLocalFileInternal (target, project, -1);
 }
 
 void OnorabAudioProcessorEditor::closeCaptureReview()
 {
-    // The capture file stays in the cache; it can be uploaded later
-    // from the Library Upload button.
+    // The capture file stays in the local cache. (There is no longer
+    // a Library Upload button to re-send it from — the review panel's
+    // Send to Drive is the way a capture reaches Drive.)
     if (captureReview != nullptr)
         captureReview->setVisible (false);
 }
@@ -2197,6 +2345,13 @@ void OnorabAudioProcessorEditor::refreshDriveStatus()
             return;
         driveConnected = detail.contains ("authenticated: 1")
                       || detail.contains ("authenticated: true");
+        // Detail format (HubClient): "provider: ..., authenticated: ...,
+        // account: <email>". The account is display-only: an empty
+        // account with authenticated=true still counts as connected.
+        juce::String account;
+        const int accountPos = detail.indexOf ("account: ");
+        if (accountPos >= 0)
+            account = detail.substring (accountPos + 9).trim();
         if (driveConnected != prevDriveConnected && settingsTab != nullptr)
             settingsTab->setDriveMessage (driveConnected ? "Drive connected." : "Not connected.");
         prevDriveConnected = driveConnected;
@@ -2204,7 +2359,7 @@ void OnorabAudioProcessorEditor::refreshDriveStatus()
         driveStatusLabel.setText (driveConnected ? "Drive connected" : "Drive not connected",
                                   juce::NotificationType::dontSendNotification);
         if (settingsTab != nullptr)
-            settingsTab->setDriveConnected (driveConnected);
+            settingsTab->setDriveConnected (driveConnected, account);
     });
 }
 

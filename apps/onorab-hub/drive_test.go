@@ -148,3 +148,72 @@ func TestDriveClientListUploadDownloadDeleteShare(t *testing.T) {
 		t.Fatalf("Share: %q %v", perm, err)
 	}
 }
+
+// Account display + disconnect (2026-11-04): the plugin must show the
+// connected Gmail without asking the user to type it, and Disconnect
+// must clear both the token and the stored account.
+func TestFetchAccountFromUserinfo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer tok123" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"email": "singer@example.com"})
+	}))
+	defer srv.Close()
+	auth := newDriveAuth("id", "", NewMemoryTokenStore())
+	auth.userinfoURL = srv.URL
+	email, err := auth.fetchAccount("tok123")
+	if err != nil || email != "singer@example.com" {
+		t.Fatalf("fetchAccount wrong: email=%q err=%v", email, err)
+	}
+}
+
+func TestDisconnectClearsTokenAndAccount(t *testing.T) {
+	revoked := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case revoked <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	store := NewMemoryTokenStore()
+	_ = store.Save("default", "refresh-abc")
+	_ = store.Save("default:account", "singer@example.com")
+	auth := newDriveAuth("id", "", store)
+	auth.revokeURL = srv.URL
+	auth.mu.Lock()
+	auth.account = "singer@example.com"
+	auth.accessToken = "tok123"
+	auth.mu.Unlock()
+	auth.Disconnect()
+	if _, err := store.Load("default"); err == nil {
+		t.Fatalf("Disconnect left the refresh token stored")
+	}
+	if _, err := store.Load("default:account"); err == nil {
+		t.Fatalf("Disconnect left the account stored")
+	}
+	if auth.Account() != "" {
+		t.Fatalf("Disconnect left account %q in memory", auth.Account())
+	}
+	select {
+	case <-revoked:
+	default:
+		t.Fatalf("Disconnect did not attempt the Google revoke call")
+	}
+}
+
+func TestEnsureAccountLoadsStoredEmailWithoutTokenRefresh(t *testing.T) {
+	store := NewMemoryTokenStore()
+	_ = store.Save("default:account", "stored@example.com")
+	// No "default" token is stored on purpose: EnsureAccount must
+	// return the persisted email WITHOUT touching the token endpoint.
+	auth := newDriveAuth("id", "", store)
+	auth.tokenURL = "http://127.0.0.1:1/invalid" // would fail if called
+	auth.EnsureAccount()
+	if auth.Account() != "stored@example.com" {
+		t.Fatalf("EnsureAccount wrong: account=%q", auth.Account())
+	}
+}

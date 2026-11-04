@@ -50,9 +50,11 @@ import (
 var buildOAuthClientID string
 
 const (
-	googleAuthURL  = "https://accounts.google.com/o/oauth2/v2/auth"
-	googleTokenURL = "https://oauth2.googleapis.com/token"
-	driveFileScope = "https://www.googleapis.com/auth/drive.file"
+	googleAuthURL     = "https://accounts.google.com/o/oauth2/v2/auth"
+	googleTokenURL    = "https://oauth2.googleapis.com/token"
+	googleUserinfoURL = "https://openidconnect.googleapis.com/v1/userinfo"
+	googleRevokeURL   = "https://oauth2.googleapis.com/revoke"
+	driveFileScope    = "https://www.googleapis.com/auth/drive.file"
 )
 
 // resolveOAuthClient returns (clientID, clientSecret, error) following
@@ -129,16 +131,29 @@ type DriveAuth struct {
 	clientSecret string
 	store        TokenStore
 	tokenURL     string
+	// userinfoURL / revokeURL are fields (not constants) so tests can
+	// point them at a local stub server. Production defaults are the
+	// Google endpoints (see newDriveAuth).
+	userinfoURL string
+	revokeURL   string
 
 	mu          sync.Mutex
 	accessToken string
 	expiresAt   time.Time
 	// account is the signed-in user's email when known (best effort).
+	// It is filled from Google's userinfo endpoint after sign-in or
+	// refresh, persisted in the OS keychain under "default:account"
+	// (a SEPARATE entry from the refresh token, so existing stored
+	// tokens keep working unchanged), and reported by /auth/status so
+	// the plugin can show the connected account WITHOUT ever asking
+	// the user to type their Gmail again. Empty means "unknown", never
+	// "no account": Authenticated() is the source of truth for that.
 	account string
 }
 
 func newDriveAuth(clientID, clientSecret string, store TokenStore) *DriveAuth {
-	return &DriveAuth{clientID: clientID, clientSecret: clientSecret, store: store, tokenURL: googleTokenURL}
+	return &DriveAuth{clientID: clientID, clientSecret: clientSecret, store: store,
+		tokenURL: googleTokenURL, userinfoURL: googleUserinfoURL, revokeURL: googleRevokeURL}
 }
 
 // Authenticated reports whether a usable sign-in exists: a live access
@@ -161,6 +176,108 @@ func (a *DriveAuth) Account() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.account
+}
+
+// fetchAccount asks Google who the access token belongs to. It is
+// best-effort by design: a failed lookup must never break sign-in or
+// token refresh — the account is display-only, never a gate.
+func (a *DriveAuth) fetchAccount(accessToken string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, a.userinfoURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("userinfo request returned %s", resp.Status)
+	}
+	var doc struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(doc.Email), nil
+}
+
+// tryFetchAccount fills the account once, from a live access token,
+// and persists it next to the token. It never holds the mutex during
+// the HTTP call, and it never fails the caller: sign-in works fine
+// with an unknown account; only the Settings display loses the email.
+func (a *DriveAuth) tryFetchAccount(accessToken string) {
+	a.mu.Lock()
+	if a.account != "" {
+		a.mu.Unlock()
+		return
+	}
+	a.mu.Unlock()
+	email, err := a.fetchAccount(accessToken)
+	if err != nil || email == "" {
+		return
+	}
+	a.mu.Lock()
+	a.account = email
+	a.mu.Unlock()
+	if a.store != nil {
+		_ = a.store.Save("default:account", email)
+	}
+}
+
+// EnsureAccount restores the account display after a Hub restart:
+// first from the persisted "default:account" entry (covers tokens
+// stored by older builds that never saved an email), otherwise from
+// a fresh userinfo lookup with a minted access token. Best-effort:
+// it silently does nothing when no sign-in exists.
+func (a *DriveAuth) EnsureAccount() {
+	if a.store != nil {
+		if email, err := a.store.Load("default:account"); err == nil && email != "" {
+			a.mu.Lock()
+			a.account = email
+			a.mu.Unlock()
+			return
+		}
+	}
+	if tok, err := a.GetAccessToken(); err == nil {
+		a.tryFetchAccount(tok)
+	}
+}
+
+// Disconnect signs the user out on this PC: it revokes the refresh
+// token at Google (best-effort — a network failure must not block
+// local sign-out), then deletes the token AND the stored account from
+// the OS keychain and clears the in-memory session. After this the
+// plugin shows "Not connected" again and a fresh Connect starts a
+// clean browser sign-in.
+func (a *DriveAuth) Disconnect() {
+	var refresh string
+	if a.store != nil {
+		refresh, _ = a.store.Load("default")
+	}
+	if refresh != "" {
+		v := url.Values{}
+		v.Set("token", refresh)
+		if req, err := http.NewRequest(http.MethodPost, a.revokeURL, strings.NewReader(v.Encode())); err == nil {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			client := &http.Client{Timeout: 10 * time.Second}
+			if resp, err := client.Do(req); err == nil {
+				_ = resp.Body.Close()
+			}
+		}
+	}
+	a.mu.Lock()
+	a.accessToken = ""
+	a.expiresAt = time.Time{}
+	a.account = ""
+	a.mu.Unlock()
+	if a.store != nil {
+		_ = a.store.Delete("default")
+		_ = a.store.Delete("default:account")
+	}
 }
 
 // GetAccessToken returns a live access token, refreshing from the
@@ -200,6 +317,9 @@ func (a *DriveAuth) GetAccessToken() (string, error) {
 	a.accessToken = resp.AccessToken
 	a.expiresAt = time.Now().Add(time.Duration(resp.ExpiresIn) * time.Second)
 	a.mu.Unlock()
+	// Fill the account display on the same refresh that proved the
+	// token still works (best-effort; a failed lookup changes nothing).
+	a.tryFetchAccount(resp.AccessToken)
 	return resp.AccessToken, nil
 }
 
@@ -312,6 +432,9 @@ func (a *DriveAuth) startBrowserSession() (authURL string, done chan error, err 
 			a.accessToken = tr.AccessToken
 			a.expiresAt = time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second)
 			a.mu.Unlock()
+			// Remember WHO signed in, so Settings can show the account
+			// without ever asking the user to type their Gmail again.
+			a.tryFetchAccount(tr.AccessToken)
 			done <- nil
 		case err := <-errCh:
 			done <- err

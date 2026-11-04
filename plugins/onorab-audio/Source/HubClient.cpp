@@ -458,7 +458,8 @@ void HubClient::getAuthStatus (AuthCallback cb)
         {
             const juce::var parsed = juce::JSON::parse (text);
             detail = "provider: " + getStringField (parsed, "provider")
-                   + ", authenticated: " + getStringField (parsed, "authenticated");
+                   + ", authenticated: " + getStringField (parsed, "authenticated")
+                   + ", account: " + getStringField (parsed, "account");
         }
         juce::MessageManager::callAsync ([cb = std::move (cb), token, ok, error, detail]() mutable
         {
@@ -517,6 +518,19 @@ void HubClient::startAuth (AuthCallback cb)
             if (token != nullptr && ! token->load())
                 return;
             cb (ok, error, authUrl);
+        });
+    });
+}
+
+void HubClient::disconnectDrive (DeleteCallback cb)
+{
+    const juce::String url = baseUrl + "/auth/disconnect";
+    auto token = aliveToken;
+    runInBackground ([url, cb = std::move (cb), token]() mutable
+    {
+        postToHub (url, "", "", token, [cb = std::move (cb)] (bool ok, juce::String error) mutable
+        {
+            cb (ok, error);
         });
     });
 }
