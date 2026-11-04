@@ -8,6 +8,7 @@
 
 #include "PluginEditor.h"
 #include "PluginProcessor.h"
+#include "PushSession.h"
 #include <algorithm>
 
 namespace
@@ -416,7 +417,17 @@ LibraryTab::LibraryTab (OnorabAudioProcessorEditor& editorIn)
     emptyLabel.setJustificationType (juce::Justification::centred);
     addAndMakeVisible (emptyLabel);
     stylePrimaryButton (emptyCaptureButton);
-    emptyCaptureButton.onClick = [this] { owner.startCapture(); };
+    emptyCaptureButton.onClick = [this]
+    {
+        // The header Capture button was replaced by the Tracks
+        // workflow, so this button toggles manual capture itself:
+        // Start when idle, Stop while capturing (the review panel
+        // appears on stop, as before).
+        if (owner.isCapturing())
+            owner.stopCapture();
+        else
+            owner.startCapture();
+    };
     addAndMakeVisible (emptyCaptureButton);
 
     fileList.setRowHeight (34);
@@ -538,6 +549,11 @@ void LibraryTab::setError (const juce::String& text)
     errorLabel.setText (text, juce::NotificationType::dontSendNotification);
     if (text.isNotEmpty())
         DBG ("Onorab UI error: " << text);
+}
+
+void LibraryTab::setEmptyCaptureButtonText (const juce::String& text)
+{
+    emptyCaptureButton.setButtonText (text);
 }
 
 void LibraryTab::setPlayer (const juce::String& name, const juce::File& localFile,
@@ -1292,6 +1308,135 @@ void CaptureReviewPanel::resized()
     statusLabel.setBounds (area);
 }
 
+// ============================== Tracks tab ==============================
+
+TracksTab::TracksTab (OnorabAudioProcessorEditor& editor)
+    : owner (editor)
+{
+    styleLabel (titleLabel, kText, 16.0f);
+    titleLabel.setText ("Tracks", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (titleLabel);
+    styleLabel (sessionLabel, kTextDim, 12.0f);
+    addAndMakeVisible (sessionLabel);
+    styleLabel (projectLabel, kTextDim, 12.0f);
+    projectLabel.setText ("Drive project:", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (projectLabel);
+    projectBox.setEditableText (true);
+    projectBox.setTextWhenNothingSelected ("Select or type a project...");
+    addAndMakeVisible (projectBox);
+    stylePrimaryButton (pushButton);
+    pushButton.onClick = [this] { owner.onPushSelected(); };
+    addAndMakeVisible (pushButton);
+    styleButton (finishButton);
+    finishButton.onClick = [this] { owner.onPushFinish(); };
+    addAndMakeVisible (finishButton);
+    styleButton (cancelButton);
+    cancelButton.onClick = [this] { owner.onPushCancel(); };
+    addAndMakeVisible (cancelButton);
+    styleLabel (statusLabel, kTextDim, 12.0f);
+    addAndMakeVisible (statusLabel);
+    styleLabel (emptyLabel, kTextDim, 13.0f);
+    emptyLabel.setText ("Add Onorab to a Mixer insert and choose Send.",
+                        juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (emptyLabel);
+    addAndMakeVisible (list);
+}
+
+void TracksTab::setView (const View& view)
+{
+    // The project list changes only when the Hub file list changes, so
+    // rebuilding the ComboBox items on every timer tick would erase
+    // text the user just typed. Rebuild only when the items differ,
+    // and always restore the current text afterwards.
+    juce::StringArray currentItems;
+    for (int i = 0; i < projectBox.getNumItems(); ++i)
+        currentItems.add (projectBox.getItemText (i));
+    juce::StringArray newItems;
+    for (const auto& p : view.projects)
+        newItems.add (p);
+    const juce::String currentText = projectBox.getText();
+    if (currentItems != newItems)
+    {
+        projectBox.clear (juce::NotificationType::dontSendNotification);
+        int itemId = 1;
+        for (const auto& p : view.projects)
+            projectBox.addItem (p, itemId++);
+        projectBox.setText (view.selectedProject.isNotEmpty() ? view.selectedProject : currentText,
+                            juce::NotificationType::dontSendNotification);
+    }
+    projectBox.setEnabled (view.projectEnabled);
+
+    pushButton.setButtonText ("Push selected (" + juce::String (view.selectedCount) + ")");
+    pushButton.setEnabled (view.pushEnabled);
+    finishButton.setVisible (view.showFinish);
+    finishButton.setButtonText (view.finishText);
+    finishButton.setEnabled (view.finishEnabled);
+    cancelButton.setVisible (view.showCancel);
+    statusLabel.setText (view.statusText, juce::NotificationType::dontSendNotification);
+    sessionLabel.setText (view.sessionText, juce::NotificationType::dontSendNotification);
+
+    rows = view.rows;
+    emptyLabel.setVisible (rows.empty());
+    list.setVisible (! rows.empty());
+    list.updateContent();
+    resized();
+}
+
+juce::String TracksTab::getSelectedProject() const
+{
+    return projectBox.getText().trim();
+}
+
+void TracksTab::resized()
+{
+    auto area = getLocalBounds().reduced (12);
+    auto top = area.removeFromTop (28);
+    titleLabel.setBounds (top.removeFromLeft (120));
+    sessionLabel.setBounds (top);
+    auto projectRow = area.removeFromTop (30);
+    projectLabel.setBounds (projectRow.removeFromLeft (110));
+    projectBox.setBounds (projectRow);
+    area.removeFromTop (8);
+    auto buttonRow = area.removeFromTop (30);
+    pushButton.setBounds (buttonRow.removeFromLeft (180));
+    buttonRow.removeFromLeft (8);
+    finishButton.setBounds (buttonRow.removeFromLeft (150));
+    buttonRow.removeFromLeft (8);
+    cancelButton.setBounds (buttonRow.removeFromLeft (90));
+    area.removeFromTop (8);
+    statusLabel.setBounds (area.removeFromTop (20));
+    area.removeFromTop (4);
+    list.setBounds (area);
+    emptyLabel.setBounds (area);
+}
+
+int TracksTab::getNumRows()
+{
+    return (int) rows.size();
+}
+
+void TracksTab::paintListBoxItem (int, juce::Graphics&, int, int, bool)
+{
+    // Rows are full components (see refreshComponentForRow).
+}
+
+juce::Component* TracksTab::refreshComponentForRow (int rowNumber, bool,
+                                                    juce::Component* existingComponentToUpdate)
+{
+    auto* row = dynamic_cast<TrackRowComponent*> (existingComponentToUpdate);
+    if (row == nullptr)
+        row = new TrackRowComponent();
+    if (rowNumber >= 0 && rowNumber < (int) rows.size())
+    {
+        const auto& data = rows[(size_t) rowNumber];
+        row->update (data.instanceId, data.trackName, data.status, data.selected,
+                     data.selectionEnabled, data.canRetry,
+                     [this] (const juce::String& id) { owner.toggleTrackSelection (id); },
+                     [this] (const juce::String& id) { owner.retryPushUpload (id); });
+    }
+    return row;
+}
+
 // ============================== Editor ==============================
 
 OnorabAudioProcessorEditor::OnorabAudioProcessorEditor (OnorabAudioProcessor& processorIn)
@@ -1324,35 +1469,84 @@ OnorabAudioProcessorEditor::OnorabAudioProcessorEditor (OnorabAudioProcessor& pr
     addAndMakeVisible (driveStatusLabel);
     styleLabel (captureCounterLabel, kText, 13.0f);
     addAndMakeVisible (captureCounterLabel);
+    // The header Capture button was replaced by the Tracks -> Push
+    // selected workflow, so it is never added to the header anymore.
+    // Manual capture is still fully usable: the Library empty-state
+    // button toggles Start / Stop (see its onClick), and setCaptureUI
+    // keeps updating its text. The captureButton member stays only so
+    // existing setCaptureUI calls keep compiling; it is never visible.
     stylePrimaryButton (captureButton);
-    captureButton.onClick = [this]
-    {
-        // Auto-capture owns the capture writer while it runs: the
-        // header Stop must never silently kill it. The user turns
-        // auto-capture off in the Projects detail view instead.
-        if (autoCaptureProject.isNotEmpty())
-        {
-            setError ("Auto-capture is on for project " + autoCaptureProject
-                      + " - turn it off in Projects before using Capture from FL.");
-            return;
-        }
-        if (audioProcessor.isCapturing())
-            stopCapture();
-        else
-            startCapture();
-    };
-    addAndMakeVisible (captureButton);
 
+    // Tracks is the Manager's main screen, so it is the first tab.
+    tracksTab = new TracksTab (*this);
     libraryTab = new LibraryTab (*this);
     projectsTab = new ProjectsTab (*this);
     transfersTab = new TransfersTab (*this);
     settingsTab = new SettingsTab (*this);
 
+    tabbedComponent.addTab ("Tracks", kPanel, tracksTab, true);
     tabbedComponent.addTab ("Library", kPanel, libraryTab, true);
     tabbedComponent.addTab ("Projects", kPanel, projectsTab, true);
     tabbedComponent.addTab ("Transfers", kPanel, transfersTab, true);
     tabbedComponent.addTab ("Settings", kPanel, settingsTab, true);
     addAndMakeVisible (tabbedComponent);
+
+    // Send editor (compact): track name, session, level meter, status.
+    // The name box renames the live registry entry, so the Manager
+    // list updates without reopening anything.
+    styleLabel (sendTitleLabel, kText, 20.0f);
+    sendTitleLabel.setText ("Onorab Send", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (sendTitleLabel);
+    styleLabel (sendNameLabel, kTextDim, 13.0f);
+    sendNameLabel.setText ("Track:", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (sendNameLabel);
+    sendNameBox.setText (audioProcessor.getTrackName());
+    sendNameBox.onTextChange = [this]
+    {
+        const juce::String name = sendNameBox.getText().trim();
+        if (name.isEmpty())
+        {
+            sendNameBox.setText (audioProcessor.getTrackName(),
+                                 juce::NotificationType::dontSendNotification);
+            return;
+        }
+        audioProcessor.setTrackName (name);
+    };
+    addAndMakeVisible (sendNameBox);
+    styleLabel (sendSessionLabel, kTextDim, 12.0f);
+    addAndMakeVisible (sendSessionLabel);
+    addAndMakeVisible (sendMeter);
+    styleLabel (sendStatusLabel, kText, 13.0f);
+    addAndMakeVisible (sendStatusLabel);
+    styleLabel (sendHintLabel, kTextDim, 12.0f);
+    sendHintLabel.setText ("Close this window - recording continues.",
+                           juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (sendHintLabel);
+
+    // First-open mode choice: one short sentence per mode, as the
+    // spec requires. There is deliberately no mode-switch button
+    // afterwards: removing and re-adding the insert changes the mode.
+    styleLabel (choiceTitleLabel, kText, 20.0f);
+    choiceTitleLabel.setText ("Onorab", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (choiceTitleLabel);
+    stylePrimaryButton (choiceSendButton);
+    choiceSendButton.onClick = [this] { chooseMode (OnorabAudioProcessor::PluginMode::Send); };
+    addAndMakeVisible (choiceSendButton);
+    styleLabel (choiceSendHintLabel, kTextDim, 12.0f);
+    choiceSendHintLabel.setText ("This insert records its Mixer Track audio for a Push.",
+                                 juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (choiceSendHintLabel);
+    stylePrimaryButton (choiceManagerButton);
+    choiceManagerButton.onClick = [this] { chooseMode (OnorabAudioProcessor::PluginMode::Manager); };
+    addAndMakeVisible (choiceManagerButton);
+    styleLabel (choiceManagerHintLabel, kTextDim, 12.0f);
+    choiceManagerHintLabel.setText ("This insert lists Sends and pushes selected tracks to Drive.",
+                                    juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (choiceManagerHintLabel);
+    styleLabel (choiceNoteLabel, kTextDim, 12.0f);
+    choiceNoteLabel.setText ("To change mode later, remove and re-add the plugin.",
+                             juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (choiceNoteLabel);
 
     captureReview = new CaptureReviewPanel (formatManager,
         [this] (const juce::String& name) { sendCaptureToDrive (name); },
@@ -1369,7 +1563,9 @@ OnorabAudioProcessorEditor::OnorabAudioProcessorEditor (OnorabAudioProcessor& pr
     refreshTransfers (true);
     refreshDriveStatus();
     refreshProjectsTab();
-    startTimer (1000);
+    // Owns visibility, editor size and the timer rate for the current
+    // mode (Manager / Send / first-open choice).
+    buildUIForMode();
 }
 
 OnorabAudioProcessorEditor::~OnorabAudioProcessorEditor()
@@ -1379,13 +1575,19 @@ OnorabAudioProcessorEditor::~OnorabAudioProcessorEditor()
     // before any member is destroyed.
     aliveToken->store (false);
     stopTimer();
+    audioProcessor.setMeterEnabled (false);
     // Auto-capture owns the same writer thread as manual capture, so
     // stopping it here (before members die) also finalizes its open
     // take. Finished-but-unuploaded takes stay queued in the
     // processor and upload when the editor reopens.
     if (autoCaptureProject.isNotEmpty())
         audioProcessor.stopAutoCapture();
-    else if (audioProcessor.isCapturing())
+    // A Push recording must NEVER be stopped by closing a window:
+    // Sends keep recording with their windows closed, and stopCapture
+    // cannot end a Push writer correctly (it never sets its done flag,
+    // so joining it would hang). The processor ends Push writers on
+    // transport Stop, Finish, Cancel, or instance destruction.
+    else if (audioProcessor.isCapturing() && ! audioProcessor.isPushRecording())
         audioProcessor.stopCapture();
     transport.stop();
     transport.setSource (nullptr);
@@ -1404,6 +1606,39 @@ void OnorabAudioProcessorEditor::paint (juce::Graphics& g)
 
 void OnorabAudioProcessorEditor::resized()
 {
+    const auto mode = audioProcessor.getMode();
+    if (mode == OnorabAudioProcessor::PluginMode::Send)
+    {
+        auto area = getLocalBounds().reduced (12);
+        sendTitleLabel.setBounds (area.removeFromTop (28));
+        auto nameRow = area.removeFromTop (28);
+        sendNameLabel.setBounds (nameRow.removeFromLeft (60));
+        sendNameBox.setBounds (nameRow);
+        area.removeFromTop (8);
+        sendSessionLabel.setBounds (area.removeFromTop (20));
+        area.removeFromTop (8);
+        sendMeter.setBounds (area.removeFromTop (18));
+        area.removeFromTop (8);
+        sendStatusLabel.setBounds (area.removeFromTop (20));
+        area.removeFromTop (8);
+        sendHintLabel.setBounds (area.removeFromTop (20));
+        return;
+    }
+    if (mode == OnorabAudioProcessor::PluginMode::Undecided)
+    {
+        auto area = getLocalBounds().reduced (16);
+        choiceTitleLabel.setBounds (area.removeFromTop (32));
+        area.removeFromTop (8);
+        choiceSendButton.setBounds (area.removeFromTop (30));
+        choiceSendHintLabel.setBounds (area.removeFromTop (20));
+        area.removeFromTop (12);
+        choiceManagerButton.setBounds (area.removeFromTop (30));
+        choiceManagerHintLabel.setBounds (area.removeFromTop (20));
+        area.removeFromTop (16);
+        choiceNoteLabel.setBounds (area.removeFromTop (20));
+        return;
+    }
+
     auto header = getLocalBounds().removeFromTop (56);
     header.removeFromLeft (12);
     titleLabel.setBounds (header.removeFromLeft (100));
@@ -1416,9 +1651,9 @@ void OnorabAudioProcessorEditor::resized()
     auto driveArea = header.removeFromLeft (180);
     driveDot.setBounds (driveArea.removeFromLeft (20));
     driveStatusLabel.setBounds (driveArea);
+    // The header Capture button is gone (Tracks workflow); the counter
+    // label keeps the remaining header space for manual-capture time.
     auto captureArea = header;
-    captureButton.setBounds (captureArea.removeFromRight (160));
-    captureArea.removeFromRight (8);
     captureCounterLabel.setBounds (captureArea);
 
     tabbedComponent.setBounds (0, 57, getWidth(), getHeight() - 57);
@@ -1458,6 +1693,36 @@ void OnorabAudioProcessorEditor::filesDropped (const juce::StringArray& files, i
 void OnorabAudioProcessorEditor::timerCallback()
 {
     ++timerTicks;
+    const auto mode = audioProcessor.getMode();
+    if (mode == OnorabAudioProcessor::PluginMode::Send)
+    {
+        // 50 ms meter + status. Decay runs on the message thread: the
+        // processor holds the last block's peak, and the display falls
+        // towards it instead of flickering to zero between blocks.
+        const float peak = audioProcessor.getOutputPeak();
+        displayedPeak = juce::jmax (peak, displayedPeak * 0.85f);
+        sendMeter.setLevel (displayedPeak);
+        juce::String status;
+        if (audioProcessor.isPushRecording())
+            status = "Recording";
+        else if (audioProcessor.isPushPrepared())
+            status = "Armed - waiting for Play";
+        else if (audioProcessor.hasFinishedPush())
+            status = "Recorded";
+        else
+            status = "Idle";
+        sendStatusLabel.setText (status, juce::NotificationType::dontSendNotification);
+        sendSessionLabel.setText ("Session: " + audioProcessor.getSessionTag(),
+                                  juce::NotificationType::dontSendNotification);
+        return;
+    }
+    if (mode == OnorabAudioProcessor::PluginMode::Undecided)
+        return;
+
+    // Manager: the Tracks state machine runs every tick (local only,
+    // no network), so Recording / upload progress appears promptly.
+    refreshTracksTab();
+
     // Auto-capture: finished takes (recorded from routed Mixer audio)
     // upload to their project here, on the message thread, one second
     // after each take ends. The processor only records; the editor
@@ -1791,13 +2056,13 @@ void OnorabAudioProcessorEditor::uploadLocalFile (const juce::File& file, const 
     uploadLocalFileInternal (file, project, -1);
 }
 
-void OnorabAudioProcessorEditor::uploadLocalFileInternal (const juce::File& file,
+int OnorabAudioProcessorEditor::uploadLocalFileInternal (const juce::File& file,
                                                           const juce::String& project, int reuseEntry)
 {
     if (! file.existsAsFile())
     {
         setError ("Upload failed: file does not exist: " + file.getFullPathName());
-        return;
+        return -1;
     }
     int entry = reuseEntry;
     if (entry < 0 || entry >= static_cast<int> (localTransfers.size()))
@@ -1852,6 +2117,7 @@ void OnorabAudioProcessorEditor::uploadLocalFileInternal (const juce::File& file
             });
         },
         project);
+    return entry;
 }
 
 void OnorabAudioProcessorEditor::uploadFilesToProject (const std::vector<juce::File>& files,
@@ -2194,6 +2460,10 @@ void OnorabAudioProcessorEditor::setPreviewGain (float gain)
 void OnorabAudioProcessorEditor::setCaptureUI (bool capturing)
 {
     captureButton.setButtonText (capturing ? "Stop" : "Capture from FL");
+    // The Library empty-state button is the manual capture toggle now
+    // that the header button is gone, so its text must follow too.
+    if (libraryTab != nullptr)
+        libraryTab->setEmptyCaptureButtonText (capturing ? "Stop" : "Capture from FL");
     captureCounterLabel.setText (capturing ? "0:00" : "",
                                   juce::NotificationType::dontSendNotification);
 }
@@ -2233,6 +2503,12 @@ void OnorabAudioProcessorEditor::startCapture()
 
 void OnorabAudioProcessorEditor::stopCapture()
 {
+    // A Push writer is never stopped from here: stopCapture cannot set
+    // its done flag or reason, so joining it would hang forever. Push
+    // writers end via transport Stop, Finish, Cancel, or instance
+    // destruction (see the processor).
+    if (audioProcessor.isPushRecording() || audioProcessor.isPushPrepared())
+        return;
     // stopCapture joins the writer thread, so the finished callback
     // (queued below) is already posted by the time this returns.
     audioProcessor.stopCapture();
@@ -2638,4 +2914,494 @@ juce::String OnorabAudioProcessorEditor::getHubUrl() const
 bool OnorabAudioProcessorEditor::isCapturing() const
 {
     return audioProcessor.isCapturing();
+}
+
+// ============================== Send / Manager + Push ==============================
+
+void OnorabAudioProcessorEditor::buildUIForMode()
+{
+    const auto mode = audioProcessor.getMode();
+    const bool isManager = mode == OnorabAudioProcessor::PluginMode::Manager;
+    const bool isSend = mode == OnorabAudioProcessor::PluginMode::Send;
+
+    // Header + tabs exist only in Manager mode. The components are all
+    // created once in the constructor; this only toggles visibility,
+    // so switching from the choice view never deletes a tab.
+    titleLabel.setVisible (isManager);
+    byLabel.setVisible (isManager);
+    hubDot.setVisible (isManager);
+    hubStatusLabel.setVisible (isManager);
+    driveDot.setVisible (isManager);
+    driveStatusLabel.setVisible (isManager);
+    captureCounterLabel.setVisible (isManager);
+    tabbedComponent.setVisible (isManager);
+    if (captureReview != nullptr)
+        captureReview->setVisible (isManager && captureReview->isVisible());
+
+    sendTitleLabel.setVisible (isSend);
+    sendNameLabel.setVisible (isSend);
+    sendNameBox.setVisible (isSend);
+    sendSessionLabel.setVisible (isSend);
+    sendMeter.setVisible (isSend);
+    sendStatusLabel.setVisible (isSend);
+    sendHintLabel.setVisible (isSend);
+
+    const bool isChoice = ! isManager && ! isSend;
+    choiceTitleLabel.setVisible (isChoice);
+    choiceSendButton.setVisible (isChoice);
+    choiceSendHintLabel.setVisible (isChoice);
+    choiceManagerButton.setVisible (isChoice);
+    choiceManagerHintLabel.setVisible (isChoice);
+    choiceNoteLabel.setVisible (isChoice);
+
+    if (isManager)
+    {
+        setSize (920, 600);
+        tabbedComponent.setCurrentTabIndex (0); // Tracks is the first tab
+        audioProcessor.setMeterEnabled (false);
+        startTimer (1000);
+    }
+    else if (isSend)
+    {
+        setSize (360, 240);
+        sendNameBox.setText (audioProcessor.getTrackName(),
+                             juce::NotificationType::dontSendNotification);
+        audioProcessor.setMeterEnabled (true);
+        displayedPeak = 0.0f;
+        startTimer (50); // meter refresh; the Send branch repaints only
+    }
+    else
+    {
+        setSize (480, 300);
+        audioProcessor.setMeterEnabled (false);
+        startTimer (1000);
+    }
+    resized();
+}
+
+void OnorabAudioProcessorEditor::chooseMode (OnorabAudioProcessor::PluginMode newMode)
+{
+    if (newMode == OnorabAudioProcessor::PluginMode::Send)
+    {
+        // Name first (unregistered, so this only sets the member),
+        // then register under that name.
+        audioProcessor.setTrackName (suggestTrackName());
+        audioProcessor.setMode (OnorabAudioProcessor::PluginMode::Send);
+    }
+    else
+    {
+        audioProcessor.setMode (OnorabAudioProcessor::PluginMode::Manager);
+    }
+    buildUIForMode();
+}
+
+juce::String OnorabAudioProcessorEditor::suggestTrackName() const
+{
+    std::set<juce::String> used;
+    for (const auto& s : PushSession::getInstance().getSends())
+        used.insert (s.trackName);
+    for (int n = 1;; ++n)
+    {
+        const juce::String candidate = "Track " + juce::String (n).paddedLeft ('0', 2);
+        if (used.find (candidate) == used.end())
+            return candidate;
+    }
+}
+
+std::vector<juce::String> OnorabAudioProcessorEditor::getKnownProjects() const
+{
+    std::vector<juce::String> out;
+    for (const auto& f : files)
+    {
+        if (f.projectId.isEmpty())
+            continue;
+        if (std::find (out.begin(), out.end(), f.projectId) == out.end())
+            out.push_back (f.projectId);
+    }
+    if (pushProject.isNotEmpty()
+        && std::find (out.begin(), out.end(), pushProject) == out.end())
+        out.push_back (pushProject);
+    return out;
+}
+
+juce::String OnorabAudioProcessorEditor::getTransferStatus (int entry) const
+{
+    if (entry < 0 || entry >= static_cast<int> (localTransfers.size()))
+        return {};
+    return localTransfers[static_cast<size_t> (entry)].status;
+}
+
+juce::String OnorabAudioProcessorEditor::takeRowStatus (const PushTakeState& takeState) const
+{
+    const auto& t = takeState.take;
+    if (! t.file.existsAsFile())
+    {
+        if (t.error.isNotEmpty())
+            return "Failed: " + t.error;
+        return "No audio recorded";
+    }
+    juce::String base = t.finishedBy == "destroyed" ? "Partial - Send closed" : "Recorded";
+    if (! takeState.uploadStarted)
+        return base + " - waiting for upload";
+    if (takeState.transferEntry < 0)
+        return base + " - Upload failed";
+    const juce::String st = getTransferStatus (takeState.transferEntry);
+    if (st == "Done")
+        return "Uploaded";
+    if (st == "Failed")
+        return base + " - Upload failed";
+    return base + " - Uploading...";
+}
+
+void OnorabAudioProcessorEditor::toggleTrackSelection (const juce::String& instanceId)
+{
+    // Selection locks once a Push is underway; the rows then show the
+    // armed set instead of the editable checkboxes.
+    if (pushPhase != PushPhase::Idle && pushPhase != PushPhase::Done)
+        return;
+    if (tracksSelected.erase (instanceId) == 0)
+        tracksSelected.insert (instanceId);
+    refreshTracksTab();
+}
+
+void OnorabAudioProcessorEditor::retryPushUpload (const juce::String& instanceId)
+{
+    for (auto& ts : pushTakes)
+    {
+        if (ts.take.instanceId == instanceId && ts.transferEntry >= 0)
+        {
+            // Re-runs the SAME upload (same file, same project) on the
+            // same transfer entry. The Hub updates a same-name file
+            // instead of duplicating it, so a retry after a lost
+            // confirmation can never create a second Drive copy.
+            retryTransfer (ts.transferEntry);
+            return;
+        }
+    }
+}
+
+void OnorabAudioProcessorEditor::onPushSelected()
+{
+    if (pushPhase != PushPhase::Idle && pushPhase != PushPhase::Done)
+        return;
+    const juce::String project = tracksTab != nullptr ? tracksTab->getSelectedProject() : juce::String {};
+    if (project.isEmpty())
+    {
+        pushNotice = "Choose a Drive project first.";
+        refreshTracksTab();
+        return;
+    }
+    if (tracksSelected.empty())
+    {
+        pushNotice = "Select at least one track.";
+        refreshTracksTab();
+        return;
+    }
+    const std::vector<juce::String> selected (tracksSelected.begin(), tracksSelected.end());
+    // Hub + Drive check first (async): a Push without a Drive
+    // connection would record audio with nowhere to send it.
+    hub.getAuthStatus ([this, project, selected] (bool ok, juce::String error, juce::String detail)
+    {
+        if (! ok)
+        {
+            pushNotice = "Drive check failed: " + error;
+            refreshTracksTab();
+            return;
+        }
+        if (! detail.contains ("authenticated: 1") && ! detail.contains ("authenticated: true"))
+        {
+            pushNotice = "Drive is not connected - connect it in Settings first.";
+            refreshTracksTab();
+            return;
+        }
+        // The passage must start from a stop: Sends begin recording on
+        // the Play transition, so starting mid-playback would clip the
+        // beginning and misalign the takes.
+        if (audioProcessor.isTransportPlaying())
+        {
+            pushNotice = "FL Studio is already playing - stop playback, move the playhead "
+                         "to the start, then press Push selected again.";
+            refreshTracksTab();
+            return;
+        }
+        auto& session = PushSession::getInstance();
+        std::vector<juce::String> prepared, missing;
+        std::vector<std::pair<juce::String, juce::String>> failed;
+        if (! session.armPush (selected, project, prepared, missing, failed))
+        {
+            juce::String message = "No track could be prepared.";
+            for (const auto& [id, err] : failed)
+                message += " " + id + ": " + err;
+            pushNotice = message;
+            refreshTracksTab();
+            return;
+        }
+        // Snapshot names now: a Send that disappears later still has
+        // a name for its row.
+        pushArmedNames.clear();
+        for (const auto& s : session.getSends())
+            pushArmedNames[s.instanceId] = s.trackName;
+        pushArmedIds = prepared;
+        pushProject = project;
+        pushIdCurrent = session.getPushId();
+        pushTakes.clear();
+        pushPhase = PushPhase::Armed;
+        pushRecordStartSeen = false;
+        pushNotice.clear();
+        if (! failed.empty() || ! missing.empty())
+        {
+            pushNotice = "Ready for " + juce::String (prepared.size()) + " track(s).";
+            if (! failed.empty())
+                pushNotice += " " + juce::String (failed.size()) + " track(s) could not be prepared.";
+            if (! missing.empty())
+                pushNotice += " " + juce::String (missing.size()) + " track(s) disappeared.";
+        }
+        refreshTracksTab();
+    });
+}
+
+void OnorabAudioProcessorEditor::onPushFinish()
+{
+    if (pushPhase != PushPhase::Recording)
+        return;
+    // The Sends finalize on their next audio block (or their writer
+    // drains on this flag if the host suspended blocks); the timer
+    // then resolves the takes and uploads them, exactly like a
+    // transport Stop.
+    PushSession::getInstance().requestFinish();
+    pushNotice.clear();
+    refreshTracksTab();
+}
+
+void OnorabAudioProcessorEditor::onPushCancel()
+{
+    if (pushPhase != PushPhase::Armed)
+        return;
+    const auto notCancelled = PushSession::getInstance().cancelPush();
+    if (! notCancelled.empty())
+    {
+        // A Send started recording between the phase check and this
+        // click: the Push stays alive and must be finished, not cut.
+        pushNotice = "Recording already started - use Finish & upload instead.";
+        refreshTracksTab();
+        return;
+    }
+    pushPhase = PushPhase::Idle;
+    pushArmedIds.clear();
+    pushArmedNames.clear();
+    pushTakes.clear();
+    pushNotice.clear();
+    refreshTracksTab();
+}
+
+void OnorabAudioProcessorEditor::refreshTracksTab()
+{
+    if (tracksTab == nullptr
+        || audioProcessor.getMode() != OnorabAudioProcessor::PluginMode::Manager)
+        return;
+    auto& session = PushSession::getInstance();
+    auto sends = session.getSends();
+    std::map<juce::String, PushSession::SendSnapshot> liveById;
+    for (const auto& s : sends)
+        liveById[s.instanceId] = s;
+
+    // Drain finished takes for the current Push. Takes from older
+    // pushes are ignored (their pushId never matches again); their
+    // WAV files stay in the cache folder.
+    if (pushPhase == PushPhase::Armed || pushPhase == PushPhase::Recording
+        || pushPhase == PushPhase::Uploading)
+    {
+        for (auto& t : session.takeTakes())
+        {
+            if (t.pushId != pushIdCurrent)
+                continue;
+            pushTakes.push_back ({ t, -1, false });
+        }
+    }
+
+    // Phase machine (driven by the Sends' own status, never by a guess).
+    if (pushPhase == PushPhase::Armed)
+    {
+        bool anyRecording = false;
+        for (const auto& id : pushArmedIds)
+            if (auto it = liveById.find (id); it != liveById.end() && it->second.status == 2)
+                anyRecording = true;
+        if (anyRecording)
+        {
+            pushPhase = PushPhase::Recording;
+            pushRecordStartTime = juce::Time::getCurrentTime();
+            pushRecordStartSeen = true;
+            pushNotice.clear();
+        }
+    }
+    if (pushPhase == PushPhase::Recording)
+    {
+        // Every armed track resolved: it has a take, or its Send is
+        // gone (missing is resolved by absence, not by waiting).
+        bool allResolved = ! pushArmedIds.empty();
+        for (const auto& id : pushArmedIds)
+        {
+            const bool hasTake = std::any_of (pushTakes.begin(), pushTakes.end(),
+                [&id] (const PushTakeState& ts) { return ts.take.instanceId == id; });
+            if (! hasTake && liveById.find (id) != liveById.end())
+                allResolved = false;
+        }
+        if (allResolved)
+        {
+            pushPhase = PushPhase::Uploading;
+            for (auto& ts : pushTakes)
+            {
+                if (ts.take.file.existsAsFile() && ! ts.uploadStarted)
+                {
+                    ts.uploadStarted = true;
+                    ts.transferEntry = uploadLocalFileInternal (ts.take.file, pushProject, -1);
+                }
+            }
+        }
+    }
+    if (pushPhase == PushPhase::Uploading)
+    {
+        bool allDone = true;
+        for (const auto& ts : pushTakes)
+        {
+            if (! ts.take.file.existsAsFile() || ! ts.uploadStarted)
+                continue;
+            // A -1 entry means the file vanished before the upload
+            // call: failed, not pending — never wait on it forever.
+            if (ts.transferEntry < 0)
+                continue;
+            const juce::String st = getTransferStatus (ts.transferEntry);
+            if (st != "Done" && st != "Failed")
+                allDone = false;
+        }
+        if (allDone)
+        {
+            int uploaded = 0, failed = 0;
+            for (const auto& ts : pushTakes)
+            {
+                if (! ts.take.file.existsAsFile())
+                    continue;
+                const juce::String st = getTransferStatus (ts.transferEntry);
+                if (st == "Done")
+                    ++uploaded;
+                else if (st == "Failed")
+                    ++failed;
+            }
+            pushPhase = PushPhase::Done;
+            pushNotice = "Upload complete: " + juce::String (uploaded) + " uploaded"
+                + (failed > 0 ? ", " + juce::String (failed) + " failed." : ".");
+            session.disarmAfterUpload();
+        }
+    }
+
+    // ---- View ----
+    TracksTab::View view;
+    view.sessionText = "Session: " + audioProcessor.getSessionTag()
+        + " - Sends in this FL project appear here.";
+    view.projects = getKnownProjects();
+    view.selectedProject = pushPhase == PushPhase::Idle || pushPhase == PushPhase::Done
+        ? (tracksTab->getSelectedProject()) : pushProject;
+    view.projectEnabled = pushPhase == PushPhase::Idle || pushPhase == PushPhase::Done;
+    const bool selectionLocked = pushPhase != PushPhase::Idle && pushPhase != PushPhase::Done;
+    view.pushEnabled = (pushPhase == PushPhase::Idle || pushPhase == PushPhase::Done)
+        && ! tracksSelected.empty();
+    view.selectedCount = selectionLocked ? (int) pushArmedIds.size() : (int) tracksSelected.size();
+    view.showFinish = pushPhase == PushPhase::Recording;
+    view.finishEnabled = ! session.isFinishRequested();
+    view.finishText = session.isFinishRequested() ? "Finishing..." : "Finish & upload";
+    view.showCancel = pushPhase == PushPhase::Armed;
+
+    if (! pushNotice.isEmpty())
+    {
+        view.statusText = pushNotice;
+    }
+    else if (pushPhase == PushPhase::Armed)
+    {
+        view.statusText = "Ready. Press Play in FL Studio.";
+    }
+    else if (pushPhase == PushPhase::Recording)
+    {
+        const double seconds = pushRecordStartSeen
+            ? (juce::Time::getCurrentTime() - pushRecordStartTime).inSeconds() : 0.0;
+        view.statusText = "Recording - " + formatDuration (seconds);
+    }
+    else if (pushPhase == PushPhase::Uploading)
+    {
+        view.statusText = "Uploading takes to " + HubClient::projectFolder (pushProject) + "...";
+    }
+    else if (pushPhase == PushPhase::Done)
+    {
+        view.statusText = "Select tracks for the next Push, or retry a failed upload.";
+    }
+    else
+    {
+        view.statusText = "Select tracks and a Drive project, then press Push selected.";
+    }
+
+    // One row per track: every live Send, plus every armed track that
+    // disappeared (its take, if any, still uploads). During a Push the
+    // checkboxes show the armed set; otherwise they show the editable
+    // selection.
+    std::set<juce::String> rowIds;
+    for (const auto& s : sends)
+        rowIds.insert (s.instanceId);
+    for (const auto& id : pushArmedIds)
+        rowIds.insert (id);
+    for (const auto& id : rowIds)
+    {
+        TracksTab::Row row;
+        row.instanceId = id;
+        const auto liveIt = liveById.find (id);
+        const auto takeIt = std::find_if (pushTakes.begin(), pushTakes.end(),
+            [&id] (const PushTakeState& ts) { return ts.take.instanceId == id; });
+        const bool hasTake = takeIt != pushTakes.end();
+        row.selected = selectionLocked
+            ? std::find (pushArmedIds.begin(), pushArmedIds.end(), id) != pushArmedIds.end()
+            : tracksSelected.find (id) != tracksSelected.end();
+        row.selectionEnabled = ! selectionLocked;
+        if (liveIt != liveById.end())
+        {
+            row.trackName = liveIt->second.trackName;
+            if (hasTake)
+            {
+                row.status = takeRowStatus (*takeIt);
+            }
+            else if (liveIt->second.status == 2)
+            {
+                row.status = "Recording";
+            }
+            else if (liveIt->second.status == 1)
+            {
+                row.status = "Armed - waiting for Play";
+            }
+            else if (liveIt->second.status == 3)
+            {
+                row.status = "Recorded";
+            }
+            else
+            {
+                row.status = "Idle";
+            }
+        }
+        else
+        {
+            row.trackName = pushArmedNames.find (id) != pushArmedNames.end()
+                ? pushArmedNames[id] : id;
+            if (hasTake)
+            {
+                row.status = takeRowStatus (*takeIt);
+                if (takeIt->take.finishedBy == "destroyed")
+                    row.status += " - Send closed";
+            }
+            else
+            {
+                row.status = "Send disappeared - no take";
+            }
+        }
+        row.canRetry = hasTake && takeIt->uploadStarted
+            && getTransferStatus (takeIt->transferEntry) == "Failed";
+        view.rows.push_back (row);
+    }
+
+    tracksTab->setView (view);
 }

@@ -5,9 +5,14 @@
 // Reference: the "Interface premium du plugin Onorab" mockup (black
 // background, readable text, light purple for selection and primary
 // actions). The mockup shows several screens at once for presentation;
-// the real plugin shows ONE tab at a time: Library, Projects,
+// the real plugin shows ONE tab at a time: Tracks, Library, Projects,
 // Transfers, Settings. A persistent header above the tabs holds the
-// title, the Hub / Drive status and the Capture from FL button.
+// title and the Hub / Drive status. The old header "Capture from FL"
+// button was replaced by the Tracks -> Push selected workflow: a
+// Manager instance lists this FL session's Send instances and pushes
+// selected Mixer Tracks to Drive as separate WAVs after one playback.
+// A Send instance shows a compact window instead (track name, session,
+// level meter, status) and keeps recording with its window closed.
 //
 // What the mockup does NOT contribute: its sounds, projects, durations,
 // waveforms, "Phone" labels and statuses are examples only and are
@@ -49,6 +54,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <vector>
 #include "HubClient.h"
 #include "WaveformView.h"
@@ -141,6 +147,10 @@ public:
                     bool localExists, double durationSeconds);
     void setPlayerPosition (double currentSeconds, double totalSeconds);
     void setPlayerPlaying (bool playing);
+    // Manual capture is toggled from this button when the library is
+    // empty (the header Capture button was replaced by the Tracks
+    // workflow, so this button must say Stop while capturing).
+    void setEmptyCaptureButtonText (const juce::String& text);
 
     void resized() override;
 
@@ -354,6 +364,130 @@ private:
 
 // ---- The editor itself ----
 
+// Small level bar for the Send editor. The editor feeds it a decayed
+// peak on its 50 ms timer; the component itself only paints.
+class LevelMeterComponent : public juce::Component
+{
+public:
+    void setLevel (float level)
+    {
+        levelValue = juce::jlimit (0.0f, 1.0f, level);
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colour (0xff1a1a1a));
+        g.setColour (juce::Colour (0xff333333));
+        g.drawRect (getLocalBounds(), 1);
+        if (levelValue > 0.0f)
+        {
+            g.setColour (levelValue > 0.9f ? juce::Colour (0xffff5555)
+                                           : juce::Colour (0xff7fd08a));
+            g.fillRect (2, 2, (int) (levelValue * (float) (getWidth() - 4)), getHeight() - 4);
+        }
+    }
+
+private:
+    float levelValue = 0.0f;
+};
+
+// One row of the Tracks tab: checkbox + track name, status text, and a
+// Retry button that appears only when that track's upload failed.
+class TrackRowComponent : public juce::Component
+{
+public:
+    void update (const juce::String& instanceIdIn, const juce::String& trackName,
+                 const juce::String& status, bool selected, bool selectionEnabled,
+                 bool canRetry, std::function<void (const juce::String&)> onToggle,
+                 std::function<void (const juce::String&)> onRetry)
+    {
+        id = instanceIdIn;
+        checkBox.setButtonText (trackName);
+        checkBox.setToggleState (selected, juce::NotificationType::dontSendNotification);
+        checkBox.setEnabled (selectionEnabled);
+        statusLabel.setText (status, juce::NotificationType::dontSendNotification);
+        retryButton.setVisible (canRetry);
+        checkBox.onClick = [this, onToggle] { onToggle (id); };
+        retryButton.onClick = [this, onRetry] { onRetry (id); };
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced (4, 2);
+        if (retryButton.isVisible())
+            retryButton.setBounds (area.removeFromRight (110));
+        statusLabel.setBounds (area.removeFromRight (220));
+        checkBox.setBounds (area);
+    }
+
+private:
+    juce::String id;
+    juce::ToggleButton checkBox;
+    juce::Label statusLabel;
+    juce::TextButton retryButton { "Retry upload" };
+};
+
+// Tracks tab (Manager mode, the default tab): the live Sends of THIS FL
+// session (from PushSession, never invented), the destination Drive
+// project, and the Push selected workflow. Rows show only real Sends
+// plus armed tracks that disappeared mid-Push; the empty state says
+// exactly how to get a Send into the list.
+class TracksTab : public juce::Component,
+                  public juce::ListBoxModel
+{
+public:
+    struct Row
+    {
+        juce::String instanceId;
+        juce::String trackName;
+        juce::String status;
+        bool selected = false;
+        bool selectionEnabled = true;
+        bool canRetry = false;
+    };
+
+    struct View
+    {
+        std::vector<Row> rows;
+        juce::String statusText;
+        juce::String sessionText;
+        std::vector<juce::String> projects;
+        juce::String selectedProject;
+        bool projectEnabled = true;
+        bool pushEnabled = false;
+        int selectedCount = 0;
+        bool showFinish = false;
+        bool finishEnabled = true;
+        juce::String finishText = "Finish & upload";
+        bool showCancel = false;
+    };
+
+    explicit TracksTab (OnorabAudioProcessorEditor& editor);
+    void setView (const View& view);
+    juce::String getSelectedProject() const;
+    void resized() override;
+
+    // ListBoxModel (custom row components; paintListBoxItem is unused
+    // but required by the base class).
+    int getNumRows() override;
+    void paintListBoxItem (int rowNumber, juce::Graphics& g, int width, int height,
+                           bool rowIsSelected) override;
+    juce::Component* refreshComponentForRow (int rowNumber, bool isRowSelected,
+                                             juce::Component* existingComponentToUpdate) override;
+
+private:
+    OnorabAudioProcessorEditor& owner;
+    std::vector<Row> rows;
+
+    juce::Label titleLabel, sessionLabel, statusLabel, projectLabel, emptyLabel;
+    juce::ComboBox projectBox;
+    juce::TextButton pushButton { "Push selected" };
+    juce::TextButton finishButton { "Finish & upload" };
+    juce::TextButton cancelButton { "Cancel" };
+    juce::ListBox list { "Tracks", this };
+};
+
 class OnorabAudioProcessorEditor : public juce::AudioProcessorEditor,
                                    public juce::DragAndDropContainer,
                                    private juce::Timer,
@@ -406,6 +540,21 @@ public:
     void discardCapture();
     void applySettings (const juce::String& hubUrl, const juce::File& cacheDir);
 
+    // Send / Manager mode + Push workflow (message thread).
+    // chooseMode is the first-open choice view: it sets the mode,
+    // suggests a free "Track NN" name for a Send, and rebuilds the UI.
+    void chooseMode (OnorabAudioProcessor::PluginMode newMode);
+    void onPushSelected();
+    void onPushFinish();
+    void onPushCancel();
+    void toggleTrackSelection (const juce::String& instanceId);
+    void retryPushUpload (const juce::String& instanceId);
+    // Drive projects known from the Hub file list (plus the current
+    // Push project, so the dropdown keeps showing it mid-Push).
+    std::vector<juce::String> getKnownProjects() const;
+    // "Done" | "Failed" | "Uploading..." | "" for a LocalTransfer entry.
+    juce::String getTransferStatus (int entry) const;
+
     // Read by the tabs.
     juce::File getCacheDir() const;
     juce::String getHubUrl() const;
@@ -452,8 +601,18 @@ private:
     int addLocalTransfer (const juce::String& fileName, const juce::String& direction);
     void updateLocalTransfer (int entry, double progress, const juce::String& status,
                               const juce::String& error, bool canRetry);
-    void uploadLocalFileInternal (const juce::File& file, const juce::String& project, int reuseEntry);
+    int uploadLocalFileInternal (const juce::File& file, const juce::String& project, int reuseEntry);
     void downloadFileInternal (const CloudFile& file, int reuseEntry);
+
+    // Push workflow internals (Manager mode, message thread).
+    // buildUIForMode toggles Manager / Send / choice visibility, the
+    // editor size and the timer rate; every component is created once
+    // in the constructor, so a mode rebuild never deletes a tab.
+    struct PushTakeState;
+    void buildUIForMode();
+    void refreshTracksTab();
+    juce::String suggestTrackName() const;
+    juce::String takeRowStatus (const PushTakeState& takeState) const;
 
     OnorabAudioProcessor& audioProcessor;
 
@@ -513,7 +672,41 @@ private:
     ProjectsTab* projectsTab = nullptr;
     TransfersTab* transfersTab = nullptr;
     SettingsTab* settingsTab = nullptr;
+    TracksTab* tracksTab = nullptr;
     juce::TabbedComponent tabbedComponent { juce::TabbedButtonBar::TabsAtTop };
+
+    // Push workflow state (Manager mode, message thread). The arm state
+    // itself lives in PushSession (so a Push survives the Manager
+    // window closing); these members are the editor's view of it plus
+    // the takes it drained and their upload entries (for Retry).
+    enum class PushPhase { Idle, Armed, Recording, Uploading, Done };
+    PushPhase pushPhase = PushPhase::Idle;
+    juce::String pushProject;
+    int pushIdCurrent = 0;
+    std::vector<juce::String> pushArmedIds;
+    std::map<juce::String, juce::String> pushArmedNames;
+    std::set<juce::String> tracksSelected;
+    struct PushTakeState
+    {
+        PushTake take;
+        int transferEntry = -1;
+        bool uploadStarted = false;
+    };
+    std::vector<PushTakeState> pushTakes;
+    juce::String pushNotice;
+    juce::Time pushRecordStartTime;
+    bool pushRecordStartSeen = false;
+
+    // Send editor UI (compact; visible only in Send mode).
+    juce::Label sendTitleLabel, sendNameLabel, sendSessionLabel, sendStatusLabel, sendHintLabel;
+    juce::TextEditor sendNameBox;
+    LevelMeterComponent sendMeter;
+    float displayedPeak = 0.0f;
+
+    // First-open mode choice UI (visible only when undecided).
+    juce::Label choiceTitleLabel, choiceSendHintLabel, choiceManagerHintLabel, choiceNoteLabel;
+    juce::TextButton choiceSendButton { "Use as Send" };
+    juce::TextButton choiceManagerButton { "Use as Manager" };
     // NOTE (JUCE 8 fix, 2026-11-03): DragAndDropContainer is NOT a
     // Component in JUCE 8, so it must be a BASE CLASS of the editor,
     // not a member - a member cannot host children (no addAndMakeVisible

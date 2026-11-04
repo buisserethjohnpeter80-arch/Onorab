@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -427,5 +428,79 @@ func TestEnsureAccountLoadsStoredEmailWithoutTokenRefresh(t *testing.T) {
 	auth.EnsureAccount()
 	if auth.Account() != "stored@example.com" {
 		t.Fatalf("EnsureAccount wrong: account=%q", auth.Account())
+	}
+}
+
+func TestUploadUpdatesExistingFileInsteadOfDuplicating(t *testing.T) {
+	run := func(existingName string) (created bool, updatedID, updatedBody string, up OnorabFile, err error) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/drive/v3/files"):
+				q := r.URL.Query().Get("q")
+				var files []driveFile
+				if strings.Contains(q, "mimeType = '") {
+					// Folder search (root or project folder).
+					if strings.Contains(q, "Onorab_projet") {
+						files = []driveFile{{ID: "root1", Name: "Onorab_projet", MimeType: folderMimeType}}
+					} else if strings.Contains(q, "marcus music") {
+						files = []driveFile{{ID: "proj1", Name: "marcus music", MimeType: folderMimeType}}
+					}
+				} else if existingName != "" {
+					// File search: the stub lists whatever name the
+					// scenario sets, so the client-side name filter
+					// is what decides create vs update.
+					files = []driveFile{{ID: "f-exist", Name: existingName, MimeType: "audio/wav", Size: "4", CreatedTime: "2026-11-04T00:00:00Z"}}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"files": files})
+			case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/upload/drive/v3/files"):
+				created = true
+				_ = json.NewEncoder(w).Encode(driveFile{ID: "up-new", Name: "Kick_push-1.wav", MimeType: "audio/wav", Size: "4", CreatedTime: "2026-11-04T00:00:00Z"})
+			case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/upload/drive/v3/files/"):
+				updatedID = strings.TrimPrefix(r.URL.Path, "/upload/drive/v3/files/")
+				body, _ := io.ReadAll(r.Body)
+				updatedBody = string(body)
+				_ = json.NewEncoder(w).Encode(driveFile{ID: updatedID, Name: "Kick_push-1.wav", MimeType: "audio/wav", Size: "4", CreatedTime: "2026-11-04T00:00:00Z"})
+			default:
+				t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		defer srv.Close()
+		c := newDriveClient(func() (string, error) { return "test-token", nil })
+		c.apiBase = srv.URL + "/drive/v3"
+		c.uploadBase = srv.URL + "/upload/drive/v3"
+		up, err = c.Upload("marcus music", "Kick_push-1.wav", []byte("WAV!"), "audio/wav")
+		return created, updatedID, updatedBody, up, err
+	}
+
+	// No existing file: a plain create, no update.
+	created, updatedID, _, up, err := run("")
+	if err != nil {
+		t.Fatalf("Upload (no existing): %v", err)
+	}
+	if !created || updatedID != "" || up.ID != "up-new" {
+		t.Fatalf("Upload (no existing) must create: created=%v updated=%q id=%q", created, updatedID, up.ID)
+	}
+
+	// Same name already in the folder: update it, never create.
+	created, updatedID, updatedBody, up, err = run("Kick_push-1.wav")
+	if err != nil {
+		t.Fatalf("Upload (existing): %v", err)
+	}
+	if created || updatedID != "f-exist" || up.ID != "f-exist" {
+		t.Fatalf("Upload (existing) must update f-exist: created=%v updated=%q id=%q", created, updatedID, up.ID)
+	}
+	if updatedBody != "WAV!" {
+		t.Fatalf("update body must carry the new bytes, got %q", updatedBody)
+	}
+
+	// A different name listed: the client-side filter must not mistake
+	// it for the target, so this is still a create.
+	created, updatedID, _, up, err = run("Bass_push-1.wav")
+	if err != nil {
+		t.Fatalf("Upload (different name): %v", err)
+	}
+	if !created || updatedID != "" || up.ID != "up-new" {
+		t.Fatalf("Upload (different name) must create: created=%v updated=%q id=%q", created, updatedID, up.ID)
 	}
 }

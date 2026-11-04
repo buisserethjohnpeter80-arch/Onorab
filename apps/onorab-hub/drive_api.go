@@ -241,11 +241,29 @@ func driveToOnorab(f driveFile, project *string) OnorabFile {
 }
 
 // Upload stores bytes in the project's folder (creating it on first
-// use) and returns the created Drive file as an OnorabFile.
+// use) and returns the Drive file as an OnorabFile.
+//
+// Retry safety: Drive allows same-name files in one folder, so a naive
+// create-only upload would silently DUPLICATE a file whenever a retry
+// ran after the first upload committed but its confirmation was lost
+// (dropped network reply, or a Manager editor that reopened mid-Push
+// and re-uploaded a take). Upload therefore checks first: when a file
+// with the same name already exists in the folder, it UPDATES that file
+// (same Drive id, new content) instead of creating a second one. New
+// versions still get new files, because Push take names are unique per
+// Push — only a true retry of the same take hits the update path.
 func (c *DriveClient) Upload(project, name string, data []byte, mime string) (OnorabFile, error) {
 	folderID, err := c.projectFolderID(project)
 	if err != nil {
 		return OnorabFile{}, err
+	}
+	// The pre-check is load-bearing for idempotency: if the list fails
+	// we cannot tell create from retry, so fail loudly instead of
+	// risking a duplicate.
+	if existing, err := c.findFileInFolder(folderID, name); err != nil {
+		return OnorabFile{}, fmt.Errorf("Drive upload pre-check failed: %w", err)
+	} else if existing != nil {
+		return c.updateFile(existing.ID, project, data, mime)
 	}
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
@@ -288,6 +306,52 @@ func (c *DriveClient) Upload(project, name string, data []byte, mime string) (On
 		p = &project
 	}
 	return driveToOnorab(created, p), nil
+}
+
+// findFileInFolder returns the non-trashed file with this exact name in
+// the folder, or nil when there is none. The query alone cannot be
+// trusted to filter by name (a stub or a loose listing may return other
+// files), so the name is re-checked client-side.
+func (c *DriveClient) findFileInFolder(folderID, name string) (*driveFile, error) {
+	q := "'" + folderID + "' in parents and name = '" + driveQuery(name) + "' and mimeType != '" + folderMimeType + "' and trashed = false"
+	files, err := c.listFilesRaw(q)
+	if err != nil {
+		return nil, err
+	}
+	for i := range files {
+		if files[i].Name == name {
+			return &files[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// updateFile replaces the content of an existing Drive file (same id,
+// same folder, same name). Media upload: the body is the raw bytes, so
+// a retry after a lost confirmation converges on one file, never two.
+func (c *DriveClient) updateFile(id, project string, data []byte, mime string) (OnorabFile, error) {
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	resp, err := c.do(http.MethodPatch, c.uploadBase+"/files/"+url.PathEscape(id)+"?uploadType=media",
+		bytes.NewReader(data), mime)
+	if err != nil {
+		return OnorabFile{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return OnorabFile{}, fmt.Errorf("Drive update failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	var updated driveFile
+	if err := json.NewDecoder(resp.Body).Decode(&updated); err != nil {
+		return OnorabFile{}, fmt.Errorf("decode Drive update: %w", err)
+	}
+	var p *string
+	if project != "" {
+		p = &project
+	}
+	return driveToOnorab(updated, p), nil
 }
 
 // GetFile returns one file's metadata (used before Download so the

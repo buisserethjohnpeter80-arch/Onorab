@@ -243,6 +243,42 @@ run. Do NOT mark any of them Pass without running them there.
       Drive with no sign-in prompt (Hub auto-launched, token
       resumed).
 
+### J. Send / Manager multi-track Push (real PC only, 2026-11-04)
+
+None of these can be proven by CI or by this VM: they need FL Studio
+with several live plugin instances. Do NOT mark any of them Pass
+without running them there. The acceptance case from the spec is J1;
+J2–J6 are its required variations.
+
+- [ ] **J1. One playback, two separate WAVs, still aligned.** In one
+      FL project: one Manager + three Sends named Kick, Bass, Vocal.
+      Vocal enters later than Kick. Select Kick + Vocal only, press
+      Push selected, play the passage once. Drive must hold exactly
+      two new WAVs in the chosen project: Kick with Kick only, Vocal
+      with Vocal only. Drop both into the Playlist at the same
+      position: Vocal still enters late, exactly as in the project.
+      Bass must NOT appear on Drive.
+- [ ] **J2. Windows closed.** Repeat J1 with all three Send windows
+      closed before pressing Play: recording still happens, takes
+      still upload, statuses still show in the Manager.
+- [ ] **J3. Reopen the .flp.** Save, close, reopen: the Manager is
+      still Manager, the Sends keep their names, and a new Push works
+      without re-choosing modes. Clone one Send insert: the clone
+      appears as its own row with its own name (not a duplicate arm
+      of the original).
+- [ ] **J4. Failed upload + Retry.** Break the upload (e.g. disconnect
+      the network after recording, or revoke Drive mid-upload): the
+      failed row shows Retry upload, the local WAV is kept, and Retry
+      (network back) succeeds WITHOUT replaying the music and WITHOUT
+      a second copy of the file on Drive.
+- [ ] **J5. Old project.** Open a pre-Push .flp that already has
+      Onorab: the instance opens as Manager with its old settings,
+      no mode question, and Library / Projects / Transfers /
+      Settings still work.
+- [ ] **J6. Post-effect capture.** Put a Send AFTER an EQ + compressor
+      on a track: the pushed WAV must contain the processed sound,
+      not the dry input.
+
 ## 4. Manual mobile checklist (mock mode)
 
 - [ ] **M1.** App opens to the Google account connection screen; mock

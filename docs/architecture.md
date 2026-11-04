@@ -405,3 +405,52 @@ Payments, subscriptions, collaboration, OneDrive, Dropbox, advanced user
 accounts, real mobile Drive sync, real Drive provider, and non-FL
 connectors. Each is a future phase with its own design note; none is
 half-implemented in Phase 1.
+
+## 8. Send / Manager multi-track Push (2026-11-04)
+
+One VST3, one installer, one name in FL's plugin list ("Onorab"). Each
+instance chooses a role once, on first open: **Send** (this insert
+records its Mixer Track) or **Manager** (this insert lists Sends and
+pushes selected tracks to Drive). An old project (state without a mode)
+opens as Manager, preserving its previous behaviour. Mode, track name
+and instance id persist in the plugin state; a cloned insert (same
+saved id, original still alive) regenerates its id, so the Manager
+never arms one Send twice.
+
+Coordination is an in-process singleton (`PushSession`), NOT the Hub:
+every instance in one FL project shares the DLL's statics, while two
+FL projects on one PC are two processes with separate singletons, so
+their tracks can never mix. The session tag ("FL-XXXX", random per
+process) is shown in both UIs so the user can see which FL session a
+Send belongs to; it is not the .flp name (the host never gives it) and
+is never sent to Drive or the Hub. This assumes FL's default unbridged
+VST3 load; bridged instances (one bridge process each) cannot see
+each other. The Hub's job stays what it was: Drive auth + upload.
+
+Push flow: Manager verifies Hub + Drive + selection, arms the Sends
+(their writers launch and idle), and shows "Ready. Press Play in FL
+Studio." (If FL is already playing, it refuses and asks for Stop +
+reposition.) On the Play transition each armed Send records its own
+WAV — no silence gating, so leading and middle silence survive and a
+late-entering Vocal stays late when both WAVs are re-imported together.
+Alignment across Sends comes from the session start sample (first
+starter wins a CAS; later starters pad leading silence up to it). On
+transport Stop or Finish & upload, every take finalizes at the same
+end region (within one audio block) and the Manager uploads only the
+selected takes to the chosen project, showing "Uploaded" only on
+Hub-confirmed success. A failed upload keeps the local WAV with Retry
+upload (no re-performance); a retry cannot duplicate a Drive file,
+because Hub Upload updates a same-name file in the folder instead of
+creating a second one, while take names stay unique per Push so a new
+Push never overwrites the previous take. A Send that disappears
+mid-recording yields either a partial take (flagged) or a "Send
+disappeared" row — never silent loss.
+
+Audio-thread rules (see section 5) hold for Push too: processBlock
+touches only atomics + the lock-free FIFO; the writer thread owns all
+file I/O; the Manager arms Sends under the registry lock on the
+message thread; the old silence-splitting auto-capture loop is a
+separate writer mode and never touches Push takes. A Push survives
+Send windows closing (processors live independently of editors) and
+Manager window closing (arm state lives in the singleton; a reopened
+Manager drains the queued takes and uploads them).

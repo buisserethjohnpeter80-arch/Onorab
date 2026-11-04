@@ -17,6 +17,17 @@ OnorabAudioProcessor::OnorabAudioProcessor()
 
 OnorabAudioProcessor::~OnorabAudioProcessor()
 {
+    // A Push writer must be ended explicitly: its loop watches
+    // pushWriterDone, not `capturing`, so the generic stop below would
+    // join a thread that never exits. cleanupPushWriter ends it with
+    // reason "destroyed" (partial take) or "cancelled" (never started)
+    // and joins it before the FIFO dies.
+    cleanupPushWriter();
+    if (mode == PluginMode::Send)
+    {
+        PushSession::getInstance().unregisterSend (instanceId);
+        pushEntry.reset();
+    }
     // Never leave a writer thread running past destruction. If capture is
     // still armed, stop it first (joins the writer after it drains).
     if (isCapturing())
@@ -64,6 +75,83 @@ void OnorabAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     if (numChannels > 0)
         lastNumChannels.store (numChannels);
 
+    // ---- Playhead cache (all modes, every block). ----
+    // Reading the host playhead from processBlock is standard JUCE
+    // practice: it is a lock-free read of host-provided data, no
+    // allocation, no I/O. The Manager uses the cache for its "FL Studio
+    // is already playing" guard; Sends use it to start on Play and
+    // finalize on Stop. When the host gives no position, the flags stay
+    // "unknown" and Push falls back to arm-driven start (first block
+    // after arming) and Finish-driven stop.
+    bool playingNow = false;
+    bool timeKnownNow = false;
+    int64_t timeSamplesNow = -1;
+    if (auto* playHead = getPlayHead(); playHead != nullptr)
+    {
+        if (auto position = playHead->getPosition(); position.hasValue())
+        {
+            playingNow = position->getIsPlaying();
+            if (auto t = position->getTimeInSamples(); t.hasValue())
+            {
+                timeKnownNow = true;
+                timeSamplesNow = *t;
+            }
+        }
+    }
+    transportPlaying.store (playingNow, std::memory_order_relaxed);
+    transportTimeKnown.store (timeKnownNow, std::memory_order_relaxed);
+    if (timeKnownNow)
+        transportTimeSamples.store (timeSamplesNow, std::memory_order_relaxed);
+
+    // ---- Send level meter (only while a Send editor is open). ----
+    // A full peak scan every block is wasted CPU when nobody watches,
+    // so it is gated on meterEnabled. The scan itself is allocation-free.
+    if (mode == PluginMode::Send && meterEnabled.load (std::memory_order_relaxed)
+        && numChannels > 0)
+    {
+        float peak = 0.0f;
+        const int numSamples = buffer.getNumSamples();
+        for (int ch = 0; ch < numChannels; ++ch)
+        {
+            const float* data = buffer.getReadPointer (ch);
+            for (int i = 0; i < numSamples; ++i)
+            {
+                const float s = data[i] < 0.0f ? -data[i] : data[i];
+                peak = juce::jmax (peak, s);
+            }
+        }
+        outputPeak.store (peak, std::memory_order_relaxed);
+    }
+
+    // ---- Push transitions (Send mode, audio thread: atomics only). ----
+    if (mode == PluginMode::Send && pushPrepared.load (std::memory_order_acquire))
+    {
+        if (! pushRecording.load (std::memory_order_acquire))
+        {
+            // Start on Play when the playhead is known; start on the
+            // first block after arming when it is not (the user was
+            // told to press Play right after Ready, so any pre-Play
+            // silence in the take is short and still preserves
+            // alignment, since every Send starts the same way).
+            if ((timeKnownNow && playingNow) || ! timeKnownNow)
+                startPushRecordingFromAudioThread();
+        }
+        else
+        {
+            bool shouldFinish = PushSession::getInstance().isFinishRequested();
+            int reason = 2; // Finish & upload
+            if (! shouldFinish && timeKnownNow && wasTransportPlaying && ! playingNow)
+            {
+                shouldFinish = true;
+                reason = 1; // transport stopped
+            }
+            if (shouldFinish)
+                finishPushRecordingFromAudioThread (reason);
+        }
+    }
+    if (timeKnownNow)
+        wasTransportPlaying = playingNow;
+
     if (! capturing.load (std::memory_order_acquire))
         return;
 
@@ -101,12 +189,19 @@ juce::AudioProcessorEditor* OnorabAudioProcessor::createEditor()
 
 void OnorabAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
-    // Persist ONLY Hub URL + cache dir. Tokens/credentials are never
-    // stored here (they live in the Hub / OS keychain), so an FL Studio
-    // project file can never leak them.
+    // Persist Hub URL + cache dir + mode + track name + instance id.
+    // Tokens/credentials are never stored here (they live in the Hub /
+    // OS keychain), so an FL Studio project file can never leak them.
+    // An old state (no mode property) loads as Manager below.
     juce::ValueTree state ("OnorabState");
     state.setProperty ("hubUrl", hubUrl, nullptr);
     state.setProperty ("cacheDir", cacheDir.getFullPathName(), nullptr);
+    state.setProperty ("pluginMode",
+                       mode == PluginMode::Send ? "send"
+                       : mode == PluginMode::Undecided ? "undecided" : "manager",
+                       nullptr);
+    state.setProperty ("trackName", trackName, nullptr);
+    state.setProperty ("instanceId", instanceId, nullptr);
     juce::MemoryOutputStream stream (destData, false);
     state.writeToStream (stream);
 }
@@ -126,14 +221,113 @@ void OnorabAudioProcessor::setStateInformation (const void* data, int sizeInByte
             if (dir.isNotEmpty())
                 cacheDir = juce::File (dir);
         }
+
+        // Mode: a state without the property is an OLD project, which
+        // opens as Manager with its previous settings intact.
+        PluginMode loadedMode = PluginMode::Manager;
+        if (state.hasProperty ("pluginMode"))
+        {
+            const juce::String m = state.getProperty ("pluginMode").toString();
+            if (m == "send")
+                loadedMode = PluginMode::Send;
+            else if (m == "undecided")
+                loadedMode = PluginMode::Undecided;
+        }
+        if (state.hasProperty ("trackName"))
+            trackName = state.getProperty ("trackName").toString();
+
+        // Unregister any previous Send registration (a reload replaces
+        // the state wholesale; the old id must not linger in the
+        // session). Then apply the loaded mode directly — setMode's
+        // push guard does not apply here because nothing can be
+        // prepared during a state load.
+        if (mode == PluginMode::Send)
+        {
+            PushSession::getInstance().unregisterSend (instanceId);
+            pushEntry.reset();
+        }
+        mode = loadedMode;
+
+        if (state.hasProperty ("instanceId"))
+            instanceId = state.getProperty ("instanceId").toString();
+        if (mode == PluginMode::Send)
+        {
+            if (instanceId.isEmpty())
+                instanceId = generateInstanceId();
+            // Clone case: FL copied this state onto a new instance
+            // while the original still lives. The copy must get its
+            // OWN identity, or the Manager would arm one Send twice.
+            // The new id is saved into the project on the next host
+            // save; in this session it is already unique.
+            while (PushSession::getInstance().isIdLive (instanceId))
+                instanceId = generateInstanceId();
+            if (trackName.isEmpty())
+                trackName = "Track 01";
+            pushEntry = PushSession::getInstance().registerSend (
+                instanceId, trackName,
+                [this] (int pid) { return preparePushRecording (pid); },
+                [this] { cancelPushPreparation(); });
+        }
     }
+}
+
+// ---- Send / Manager mode ----
+
+juce::String OnorabAudioProcessor::generateInstanceId()
+{
+    // Random 64-bit hex. Uniqueness only needs to hold within one FL
+    // process (the registry is per-process), but a random id also
+    // survives a project file copied to another PC.
+    const uint64_t r = static_cast<uint64_t> (juce::Random::getSystemRandom().nextInt64());
+    juce::String hex;
+    for (int shift = 60; shift >= 0; shift -= 4)
+        hex += "0123456789ABCDEF"[(r >> shift) & 0xF];
+    return "send-" + hex;
+}
+
+void OnorabAudioProcessor::setMode (PluginMode newMode)
+{
+    if (newMode == mode)
+        return;
+    // Never orphan a live Push writer by switching mode under it.
+    if (pushPrepared.load())
+        return;
+    if (mode == PluginMode::Send)
+    {
+        PushSession::getInstance().unregisterSend (instanceId);
+        pushEntry.reset();
+    }
+    mode = newMode;
+    if (newMode == PluginMode::Send)
+    {
+        if (instanceId.isEmpty())
+            instanceId = generateInstanceId();
+        // Same clone guard as setStateInformation (single message
+        // thread, so check-then-register cannot race).
+        while (PushSession::getInstance().isIdLive (instanceId))
+            instanceId = generateInstanceId();
+        pushEntry = PushSession::getInstance().registerSend (
+            instanceId, trackName,
+            [this] (int pid) { return preparePushRecording (pid); },
+            [this] { cancelPushPreparation(); });
+    }
+}
+
+void OnorabAudioProcessor::setTrackName (const juce::String& name)
+{
+    trackName = name;
+    // Registered Sends rename live in the Manager list; unregistered
+    // instances (choice not made yet) just keep the member.
+    if (pushEntry != nullptr)
+        PushSession::getInstance().renameSend (instanceId, name);
 }
 
 void OnorabAudioProcessor::startCapture (const juce::String& fileName, CaptureFinishedCallback cb)
 {
-    if (isCapturing())
+    if (isCapturing() || pushPrepared.load())
     {
-        // Already capturing: report, don't silently restart and lose audio.
+        // Already capturing (manual, auto, or a prepared Push writer):
+        // report, don't silently restart and lose audio.
         if (cb)
             cb ({}, "Capture is already running — stop it before starting a new one.");
         return;
@@ -173,7 +367,7 @@ void OnorabAudioProcessor::stopCapture()
 
 bool OnorabAudioProcessor::startAutoCapture (const juce::String& project)
 {
-    if (isCapturing())
+    if (isCapturing() || pushPrepared.load())
         return false;
 
     const int channels = juce::jlimit (1, 2, lastNumChannels.load());
@@ -493,6 +687,321 @@ void OnorabAudioProcessor::captureWriterLoop (juce::File outFile, int numChannel
         captureFinishedCallback = nullptr;
         cb (error.isEmpty() ? outFile : juce::File {}, error);
     }
+}
+
+// ---- Push recording (Send mode) ----
+
+juce::String OnorabAudioProcessor::preparePushRecording (int pushId)
+{
+    // Message thread, called by PushSession while the registry lock is
+    // held (so this Send cannot be destroyed mid-prepare). The writer
+    // launches now and idles on an empty FIFO; the audio thread starts
+    // it for real when the transport starts playing.
+    if (mode != PluginMode::Send)
+        return "This instance is not in Send mode.";
+    if (isCapturing())
+        return "Send is busy with another capture.";
+    if (pushPrepared.load())
+    {
+        // A previous Push ended (writer exited) or was prepared but
+        // never started (writer idle): shut that writer down first so
+        // this prepare owns a fresh thread. A RECORDING Send cannot
+        // reach here: it has isCapturing() true and failed above.
+        pushWriterDone.store (true, std::memory_order_release);
+        if (captureWriterThread.joinable())
+            captureWriterThread.join();
+        pushPrepared.store (false, std::memory_order_release);
+    }
+    if (captureWriterThread.joinable())
+        captureWriterThread.join();
+
+    const int channels = juce::jlimit (1, 2, lastNumChannels.load());
+    const double sampleRate = getSampleRate() > 0.0 ? getSampleRate() : 48000.0;
+    if (! cacheDir.exists() && ! cacheDir.createDirectory())
+        return "Could not create the cache folder: " + cacheDir.getFullPathName();
+
+    // Unique per Push AND per Send: the track name plus a millisecond
+    // timestamp plus the instance's short id. Two Sends with the same
+    // track name can never truncate each other's take, and a new Push
+    // for the same track never silently overwrites the previous take.
+    pushTakeName = trackName.isNotEmpty() ? trackName : "Track";
+    const juce::String shortId = instanceId.length() >= 4
+        ? instanceId.substring (instanceId.length() - 4) : instanceId;
+    const juce::String fileName = HubClient::sanitiseFileName (
+        pushTakeName + "_push-"
+        + juce::String (juce::Time::getCurrentTime().toMilliseconds())
+        + "-" + shortId + ".wav");
+    juce::File outFile = cacheDir.getChildFile (fileName);
+
+    pushIdCurrent = pushId;
+    pushDroppedBaseline = droppedSamples.load();
+    pushWriterDone.store (false, std::memory_order_release);
+    pushRecording.store (false, std::memory_order_release);
+    pushFinished.store (false, std::memory_order_release);
+    pushFinishReason.store (0, std::memory_order_relaxed);
+    pushLeadSilenceFrames.store (0, std::memory_order_relaxed);
+    captureFifo.reset();
+
+    captureWriterThread = std::thread ([this, outFile, channels, sampleRate, pushId]
+    {
+        captureWriterLoopPush (channels, sampleRate, outFile, pushId);
+    });
+    pushPrepared.store (true, std::memory_order_release);
+    if (pushEntry != nullptr)
+        pushEntry->status.store (1); // Prepared
+    return "";
+}
+
+void OnorabAudioProcessor::cancelPushPreparation()
+{
+    // Only a prepared-but-never-started Send can be cancelled: its
+    // writer exits with reason "cancelled" and queues no take. A
+    // recording Send ignores this (it ends via Stop / Finish only).
+    if (! pushPrepared.load() || pushRecording.load())
+        return;
+    pushFinishReason.store (4, std::memory_order_relaxed);
+    pushWriterDone.store (true, std::memory_order_release);
+    pushPrepared.store (false, std::memory_order_release);
+    if (pushEntry != nullptr)
+        pushEntry->status.store (0); // Idle
+    // The thread object is joined at the next prepare / destruction;
+    // the writer itself has already been told to exit.
+}
+
+void OnorabAudioProcessor::startPushRecordingFromAudioThread()
+{
+    // Audio thread: atomics + the FIFO flag only. No allocation, no
+    // locks, no I/O. The order matters: lead silence is stored BEFORE
+    // the capturing flag (release), so the writer — which only sees
+    // FIFO data after the flag — always sees the padding.
+    const int64_t startSample = transportTimeKnown.load (std::memory_order_acquire)
+        ? transportTimeSamples.load (std::memory_order_acquire) : -1;
+    if (startSample >= 0)
+    {
+        int64_t expected = -1;
+        PushSession::getInstance().compareExchangePushStart (expected, startSample);
+        const int64_t sessionStart = PushSession::getInstance().getPushStartSample();
+        pushLeadSilenceFrames.store (
+            sessionStart >= 0 && startSample > sessionStart ? startSample - sessionStart : 0,
+            std::memory_order_relaxed);
+    }
+    else
+    {
+        pushLeadSilenceFrames.store (0, std::memory_order_relaxed);
+    }
+    capturing.store (true, std::memory_order_release);
+    pushRecording.store (true, std::memory_order_release);
+    if (pushEntry != nullptr)
+    {
+        pushEntry->status.store (2); // Recording
+        pushEntry->framesWritten.store (0);
+    }
+}
+
+void OnorabAudioProcessor::finishPushRecordingFromAudioThread (int reasonCode)
+{
+    // Audio thread: reason FIRST, then the flags (release), so the
+    // writer always sees the reason when it drains and exits.
+    pushFinishReason.store (reasonCode, std::memory_order_relaxed);
+    capturing.store (false, std::memory_order_release);
+    pushWriterDone.store (true, std::memory_order_release);
+    pushRecording.store (false, std::memory_order_release);
+    pushFinished.store (true, std::memory_order_release);
+    if (pushEntry != nullptr)
+        pushEntry->status.store (3); // Finished
+}
+
+void OnorabAudioProcessor::cleanupPushWriter()
+{
+    if (! pushPrepared.load())
+        return;
+    // A mid-recording destruction is a partial take ("destroyed"); a
+    // prepared-but-never-started destruction is an abandoned Push
+    // ("cancelled": no take). A normally finalized Push keeps its
+    // reason — the writer already queued its take.
+    if (pushRecording.load())
+        pushFinishReason.store (3, std::memory_order_relaxed);
+    else
+        pushFinishReason.store (4, std::memory_order_relaxed);
+    capturing.store (false, std::memory_order_release);
+    pushWriterDone.store (true, std::memory_order_release);
+    pushRecording.store (false, std::memory_order_release);
+    if (captureWriterThread.joinable())
+        captureWriterThread.join();
+    pushPrepared.store (false, std::memory_order_release);
+}
+
+void OnorabAudioProcessor::captureWriterLoopPush (int numChannels, double sampleRate,
+                                                  juce::File outFile, int pushId)
+{
+    // Writer thread ONLY. Lazy file creation: a prepared-but-never-
+    // started Send creates no file and (unless cancelled) queues an
+    // empty take, so the Manager can resolve it as "No audio recorded"
+    // instead of waiting forever. NOTHING is silence-gated here —
+    // silence is timing — and leading silence pads the take up to the
+    // session start sample before the first real audio.
+    juce::WavAudioFormat wavFormat;
+    std::unique_ptr<juce::AudioFormatWriter> writer;
+    juce::String writeError;
+    int64_t totalFrames = 0;
+    bool fileCreated = false;
+    bool leadWritten = false;
+
+    auto createWriter = [&]() -> bool
+    {
+        std::unique_ptr<juce::FileOutputStream> stream (outFile.createOutputStream());
+        if (stream == nullptr)
+        {
+            writeError = "Could not create the take file: " + outFile.getFullPathName();
+            return false;
+        }
+        std::unique_ptr<juce::AudioFormatWriter> newWriter (
+            wavFormat.createWriterFor (stream.get(), sampleRate,
+                                       static_cast<unsigned int> (numChannels),
+                                       16, {}, 0));
+        if (newWriter == nullptr)
+        {
+            outFile.deleteFile();
+            writeError = "Could not create a WAV writer for: " + outFile.getFullPathName();
+            return false;
+        }
+        stream.release(); // owned by the writer now
+        writer = std::move (newWriter);
+        fileCreated = true;
+        return true;
+    };
+
+    auto writeSilence = [&](int64_t frames) -> bool
+    {
+        juce::AudioBuffer<float> silence (numChannels, 4096);
+        silence.clear();
+        while (frames > 0)
+        {
+            const int chunk = static_cast<int> (juce::jmin<int64_t> (4096, frames));
+            if (! writer->writeFromAudioSampleBuffer (silence, 0, chunk))
+                return false;
+            frames -= chunk;
+            totalFrames += chunk;
+        }
+        return true;
+    };
+
+    constexpr int kChunkFrames = 4096;
+    juce::AudioBuffer<float> chunk (numChannels, kChunkFrames);
+    std::vector<float> interleaved (static_cast<size_t> (kChunkFrames)
+                                    * static_cast<size_t> (numChannels));
+
+    // The loop also watches the session's finishRequested flag: a
+    // prepared-but-never-started Send has no audio-thread finalize
+    // (it never started), so Finish & upload is its only exit signal.
+    while ((! pushWriterDone.load (std::memory_order_acquire)
+            && ! PushSession::getInstance().isFinishRequested())
+           || captureFifo.getNumReady() > 0)
+    {
+        const int readySamples = captureFifo.getNumReady();
+        if (readySamples < numChannels)
+        {
+            if (pushWriterDone.load (std::memory_order_acquire)
+                || PushSession::getInstance().isFinishRequested())
+                break;
+            // Nothing complete to write yet; poll briefly. (Polling
+            // here is fine: this is the writer thread, not the audio
+            // thread, and it never blocks the RT side.)
+            std::this_thread::sleep_for (std::chrono::milliseconds (5));
+            continue;
+        }
+        const int framesAvailable = readySamples / numChannels;
+        const int framesToWrite = juce::jmin (kChunkFrames, framesAvailable);
+        const int read = captureFifo.read (interleaved.data(), framesToWrite * numChannels);
+        const int framesRead = read / numChannels;
+        if (framesRead <= 0)
+            continue;
+
+        if (! fileCreated && ! createWriter())
+            break;
+        if (! leadWritten)
+        {
+            leadWritten = true;
+            const int64_t lead = pushLeadSilenceFrames.load (std::memory_order_relaxed);
+            if (lead > 0 && ! writeSilence (lead))
+            {
+                writeError = "Failed while writing the take file: " + outFile.getFullPathName();
+                break;
+            }
+        }
+
+        // De-interleave into the JUCE buffer for the writer.
+        for (int ch = 0; ch < numChannels; ++ch)
+            for (int frame = 0; frame < framesRead; ++frame)
+                chunk.setSample (ch, frame,
+                                 interleaved[static_cast<size_t> (frame)
+                                             * static_cast<size_t> (numChannels)
+                                             + static_cast<size_t> (ch)]);
+
+        if (! writer->writeFromAudioSampleBuffer (chunk, 0, framesRead))
+        {
+            writeError = "Failed while writing the take file: " + outFile.getFullPathName();
+            break;
+        }
+        totalFrames += framesRead;
+        if (pushEntry != nullptr)
+            pushEntry->framesWritten.store (totalFrames);
+    }
+
+    if (writer != nullptr)
+    {
+        writer->flush();
+        writer.reset(); // closes the file
+    }
+
+    const int dropped = droppedSamples.load() - pushDroppedBaseline;
+    const int reason = pushFinishReason.load (std::memory_order_relaxed);
+    juce::String finishedBy;
+    if (reason == 1)
+        finishedBy = "stop";
+    else if (reason == 2)
+        finishedBy = "finish";
+    else if (reason == 3)
+        finishedBy = "destroyed";
+    else if (reason == 4)
+        finishedBy = "cancelled";
+    else if (PushSession::getInstance().isFinishRequested())
+        finishedBy = "finish"; // prepared, never started, ended by Finish
+    else
+        finishedBy = "stop";
+
+    // Cancelled writers queue nothing: the Manager already forgot the
+    // Push. Every other exit queues exactly one take — a real file
+    // (even partial), an error take (no file + reason), or an empty
+    // take (no audio recorded) — so the Manager can resolve every
+    // armed track instead of waiting forever.
+    if (finishedBy != "cancelled")
+    {
+        if (fileCreated && writeError.isEmpty() && outFile.existsAsFile())
+        {
+            PushSession::getInstance().queueTake (
+                { instanceId, pushTakeName, outFile, totalFrames,
+                  dropped > 0 ? dropped : 0, finishedBy, pushId, {} });
+        }
+        else if (! writeError.isEmpty())
+        {
+            if (fileCreated)
+                outFile.deleteFile();
+            PushSession::getInstance().queueTake (
+                { instanceId, pushTakeName, {}, 0,
+                  dropped > 0 ? dropped : 0, finishedBy, pushId, writeError });
+        }
+        else
+        {
+            PushSession::getInstance().queueTake (
+                { instanceId, pushTakeName, {}, 0,
+                  dropped > 0 ? dropped : 0, finishedBy, pushId, {} });
+        }
+    }
+
+    if (pushEntry != nullptr)
+        pushEntry->status.store (3); // Finished (writer done)
+    pushPrepared.store (false, std::memory_order_release);
 }
 
 // Required by JUCE: factory function that creates an instance of the plugin.
