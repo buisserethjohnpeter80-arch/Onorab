@@ -53,7 +53,7 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
-          makensis /DSRC_DIR=staging dist/windows/installer.nsi
+           makensis /NOCD /DSRC_DIR=staging dist/windows/installer.nsi
       - uses: actions/upload-artifact@v4
         with:
           name: onorab-windows
