@@ -132,7 +132,7 @@ func TestBrowserSessionSuccessPageOnlyAfterExchange(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	var body strings.Builder
-	if _, err := body.ReadFrom(resp.Body); err != nil {
+	if _, err := io.Copy(&body, resp.Body); err != nil {
 		t.Fatalf("read redirect body: %v", err)
 	}
 	if !strings.Contains(body.String(), "Onorab is connected") {
@@ -178,7 +178,7 @@ func TestBrowserSessionExchangeFailureShowsErrorNotSuccess(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	var body strings.Builder
-	_, _ = body.ReadFrom(resp.Body)
+	_, _ = io.Copy(&body, resp.Body)
 	if strings.Contains(body.String(), "Onorab is connected") {
 		t.Fatalf("error page must never say connected: %q", body.String())
 	}
@@ -216,7 +216,7 @@ func TestBrowserSessionCancelReportsFailure(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	var body strings.Builder
-	_, _ = body.ReadFrom(resp.Body)
+	_, _ = io.Copy(&body, resp.Body)
 	if !strings.Contains(body.String(), "cancelled") {
 		t.Fatalf("cancel page must say cancelled: %q", body.String())
 	}
@@ -474,7 +474,7 @@ func TestUploadUpdatesExistingFileInsteadOfDuplicating(t *testing.T) {
 	}
 
 	// No existing file: a plain create, no update.
-	created, updatedID, _, up, err := run("")
+	created, updatedID, updatedBody, up, err := run("")
 	if err != nil {
 		t.Fatalf("Upload (no existing): %v", err)
 	}
