@@ -56,6 +56,8 @@
 #include <memory>
 #include <set>
 #include <vector>
+#include "PushSession.h"
+#include "PluginProcessor.h"
 #include "HubClient.h"
 #include "WaveformView.h"
 

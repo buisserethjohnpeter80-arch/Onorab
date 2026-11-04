@@ -86,6 +86,9 @@ void HubClient::runInBackground (std::function<void()> work)
         }
         catch (const std::exception& e)
         {
+            // (void) e: in Release builds DBG expands to nothing, so
+            // without this the catch parameter reads as unreferenced.
+            (void) e;
             DBG ("Onorab HubClient: unexpected exception: " << e.what());
         }
         catch (...)

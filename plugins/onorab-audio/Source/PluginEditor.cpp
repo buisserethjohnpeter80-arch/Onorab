@@ -548,7 +548,9 @@ void LibraryTab::setError (const juce::String& text)
 {
     errorLabel.setText (text, juce::NotificationType::dontSendNotification);
     if (text.isNotEmpty())
+    {
         DBG ("Onorab UI error: " << text);
+    }
 }
 
 void LibraryTab::setEmptyCaptureButtonText (const juce::String& text)
@@ -1791,7 +1793,9 @@ void OnorabAudioProcessorEditor::setError (const juce::String& text)
     if (projectsTab != nullptr)
         projectsTab->setStatus (text, true);
     if (text.isNotEmpty())
+    {
         DBG ("Onorab UI error: " << text);
+    }
 }
 
 void OnorabAudioProcessorEditor::setProgress (const juce::String& text)
