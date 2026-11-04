@@ -21,6 +21,16 @@
 ; Hub cache and the Credential Manager token: reinstalling then
 ; reconnects automatically instead of forcing another sign-in.
 ;
+; Before writing (and before uninstalling), the installer stops a
+; running onorab-hub.exe: the Hub has no window and survives FL
+; Studio closing, so it is usually still running, and Windows
+; refuses to overwrite a running .exe ("Error opening file for
+; writing"). The kill is silent and its result is ignored: if no
+; Hub is running, taskkill simply reports "not found" and the
+; install continues. FL Studio itself is NEVER killed (unsaved
+; work) — the welcome page still asks the user to close it first,
+; so the loaded VST3 can be replaced.
+;
 ; Requires admin (RequestExecutionLevel admin) because both target
 ; folders live under Program Files. The welcome page tells the user
 ; to close FL Studio first, so locked plugin files can be replaced.
@@ -43,6 +53,14 @@ RequestExecutionLevel admin
 !insertmacro MUI_LANGUAGE "English"
 
 Section "Install"
+  ; Stop a running Hub first (see header note): otherwise writing
+  ; onorab-hub.exe fails with "Error opening file for writing".
+  ; nsExec runs hidden; both stack items are popped and ignored —
+  ; "not found" (no Hub running) is a normal, non-fatal result.
+  nsExec::ExecToStack '"$SYSDIR\taskkill.exe" /F /IM onorab-hub.exe'
+  Pop $0
+  Pop $1
+  Sleep 1000
   SetOutPath "$COMMONFILES64\VST3"
   File /r "${SRC_DIR}\Onorab.vst3"
   SetOutPath "$PROGRAMFILES64\Onorab"
@@ -54,6 +72,13 @@ Section "Install"
 SectionEnd
 
 Section "Uninstall"
+  ; Same lock problem as install: stop the Hub so its exe can be
+  ; deleted. (A Hub relaunched by a still-open FL Studio may still
+  ; hold the file — close FL Studio before uninstalling.)
+  nsExec::ExecToStack '"$SYSDIR\taskkill.exe" /F /IM onorab-hub.exe'
+  Pop $0
+  Pop $1
+  Sleep 1000
   RMDir /r "$COMMONFILES64\VST3\Onorab.vst3"
   Delete "$PROGRAMFILES64\Onorab\onorab-hub.exe"
   Delete "$PROGRAMFILES64\Onorab\uninstall.exe"
