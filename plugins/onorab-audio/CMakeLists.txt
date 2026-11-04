@@ -55,15 +55,16 @@ target_sources(Onorab
         Source/WaveformView.cpp
 )
 
-# MSVC reads source files in the local codepage by default, which turned
-# UTF-8 punctuation in UI strings into mojibake ("a" with accents) in
-# the built plugin. /utf-8 makes string literals mean what the source
-# says. The redesign also keeps all new UI strings plain ASCII, so the
-# fix does not depend on this flag alone.
-if (MSVC)
-    target_compile_options(Onorab PRIVATE /utf-8)
-endif()
-
+# NOTE (2026-11-04): an earlier revision passed /utf-8 to MSVC here to
+# stop UTF-8 punctuation in UI strings turning into mojibake. That flag
+# was the only build-system change in the redesign push whose Windows
+# run then failed deterministically with C1083 (missing generated
+# JuceHeader.h), so it is REVERTED as a controlled experiment: if the
+# next run goes green, the flag was the trigger; if it stays red, the
+# cause is environmental (runner/JUCE toolchain) and the fix lies
+# elsewhere. The mojibake fix does NOT depend on this flag: all
+# redesign UI strings are plain ASCII, which renders correctly under
+# any MSVC source codepage.
 target_compile_definitions(Onorab
     PRIVATE
         # No embedded web browser in the plugin UI.
