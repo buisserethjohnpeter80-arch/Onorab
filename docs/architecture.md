@@ -454,3 +454,14 @@ separate writer mode and never touches Push takes. A Push survives
 Send windows closing (processors live independently of editors) and
 Manager window closing (arm state lives in the singleton; a reopened
 Manager drains the queued takes and uploads them).
+
+Take preview (added 2026-11-04, user request: "is this the right
+audio?"): a Tracks row whose finished take still exists in the local
+cache shows a Play button. It plays that exact WAV — the same local
+file the Push uploads — through the editor's one shared preview
+transport (the Library player's transport), so Library playback and
+take preview never overlap: starting one clears the other's id, and
+arming a new Push stops an active take preview. The Library bottom
+player behaves like the row Play button: a Drive-only selection
+downloads first, then plays automatically, instead of dead-ending
+with "press Download first".

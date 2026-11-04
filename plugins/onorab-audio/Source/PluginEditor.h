@@ -406,8 +406,10 @@ public:
 
     void update (const juce::String& instanceIdIn, const juce::String& trackName,
                  const juce::String& status, bool selected, bool selectionEnabled,
-                 bool canRetry, std::function<void (const juce::String&)> onToggle,
-                 std::function<void (const juce::String&)> onRetry)
+                 bool canRetry, bool canPlay, bool isPlaying,
+                 std::function<void (const juce::String&)> onToggle,
+                 std::function<void (const juce::String&)> onRetry,
+                 std::function<void (const juce::String&)> onPlayPause)
     {
         id = instanceIdIn;
         checkBox.setButtonText (trackName);
@@ -415,13 +417,22 @@ public:
         checkBox.setEnabled (selectionEnabled);
         statusLabel.setText (status, juce::NotificationType::dontSendNotification);
         retryButton.setVisible (canRetry);
+        playButton.setVisible (canPlay);
+        playButton.setPauseIcon (isPlaying);
         checkBox.onClick = [this, onToggle] { onToggle (id); };
         retryButton.onClick = [this, onRetry] { onRetry (id); };
+        playButton.onClick = [this, onPlayPause] { onPlayPause (id); };
+        // Layout must follow visibility here: a reused row component
+        // keeps its old bounds (no resized call), so a button that
+        // just became visible would otherwise keep zero bounds.
+        resized();
     }
 
     void resized() override
     {
         auto area = getLocalBounds().reduced (4, 2);
+        if (playButton.isVisible())
+            playButton.setBounds (area.removeFromLeft (28));
         if (retryButton.isVisible())
             retryButton.setBounds (area.removeFromRight (110));
         statusLabel.setBounds (area.removeFromRight (220));
@@ -433,6 +444,7 @@ private:
     juce::ToggleButton checkBox;
     juce::Label statusLabel;
     juce::TextButton retryButton { "Retry upload" };
+    IconButton playButton;
 };
 
 // Tracks tab (Manager mode, the default tab): the live Sends of THIS FL
@@ -452,6 +464,11 @@ public:
         bool selected = false;
         bool selectionEnabled = true;
         bool canRetry = false;
+        // Take preview: true only when this row has a finished take
+        // whose WAV still exists locally; isPlaying tracks the shared
+        // preview transport (one preview at a time, Library or Tracks).
+        bool canPlay = false;
+        bool isPlaying = false;
     };
 
     struct View
@@ -556,6 +573,11 @@ public:
     void onPushCancel();
     void toggleTrackSelection (const juce::String& instanceId);
     void retryPushUpload (const juce::String& instanceId);
+    // Take preview (Tracks rows): plays the finished take's local WAV
+    // through the shared preview transport, so the musician can hear
+    // exactly what the Send recorded before trusting the upload.
+    void toggleTakePreview (const juce::String& instanceId);
+    void playTakePreview (const juce::String& instanceId, const juce::File& file);
     // Drive projects known from the Hub file list (plus the current
     // Push project, so the dropdown keeps showing it mid-Push).
     std::vector<juce::String> getKnownProjects() const;
@@ -640,6 +662,11 @@ private:
     double selectedDurationSeconds = -1.0;
     juce::String playingFileId;
     juce::String playAfterDownloadId;
+    // Instance id of the Push take currently previewing from Tracks
+    // (empty when no take preview is active). Library playback clears
+    // this; take playback clears playingFileId — one transport, one
+    // preview at a time.
+    juce::String playingTakeId;
     std::vector<TransferInfo> hubTransfers;
     std::vector<LocalTransfer> localTransfers;
     bool hubConnected = false;

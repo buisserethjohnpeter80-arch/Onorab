@@ -1428,6 +1428,9 @@ TrackRowComponent::TrackRowComponent()
     addAndMakeVisible (statusLabel);
     styleButton (retryButton);
     addAndMakeVisible (retryButton);
+    // IconButton paints its own play/pause glyph (same component as
+    // the Library rows); visibility is driven per row by update().
+    addAndMakeVisible (playButton);
 }
 
 void TracksTab::paintListBoxItem (int, juce::Graphics&, int, int, bool)
@@ -1445,9 +1448,10 @@ juce::Component* TracksTab::refreshComponentForRow (int rowNumber, bool,
     {
         const auto& data = rows[(size_t) rowNumber];
         row->update (data.instanceId, data.trackName, data.status, data.selected,
-                     data.selectionEnabled, data.canRetry,
+                     data.selectionEnabled, data.canRetry, data.canPlay, data.isPlaying,
                      [this] (const juce::String& id) { owner.toggleTrackSelection (id); },
-                     [this] (const juce::String& id) { owner.retryPushUpload (id); });
+                     [this] (const juce::String& id) { owner.retryPushUpload (id); },
+                     [this] (const juce::String& id) { owner.toggleTakePreview (id); });
     }
     return row;
 }
@@ -1976,6 +1980,13 @@ void OnorabAudioProcessorEditor::downloadFileInternal (const CloudFile& file, in
 
 void OnorabAudioProcessorEditor::playRowFile (const CloudFile& file)
 {
+    // Library playback takes over the shared transport: a Tracks take
+    // preview must not keep claiming the play icon afterwards.
+    if (playingTakeId.isNotEmpty())
+    {
+        playingTakeId.clear();
+        refreshTracksTab();
+    }
     if (! hasSelection || selectedFile.id != file.id)
         onFileSelected (file);
     if (selectedLocalExists)
@@ -2439,6 +2450,11 @@ void OnorabAudioProcessorEditor::stopPreview()
     transport.stop();
     transport.setPosition (0.0);
     playingFileId.clear();
+    if (playingTakeId.isNotEmpty())
+    {
+        playingTakeId.clear();
+        refreshTracksTab();
+    }
     syncPlayerState();
     if (libraryTab != nullptr && previewSource != nullptr)
         libraryTab->setPlayerPosition (0.0, transport.getLengthInSeconds());
@@ -2446,26 +2462,21 @@ void OnorabAudioProcessorEditor::stopPreview()
 
 void OnorabAudioProcessorEditor::togglePlayerPlay()
 {
-    if (transport.isPlaying())
+    // The bottom player now behaves like the row Play button: a
+    // Drive-only selection downloads first, then plays automatically
+    // (playAfterDownloadId). Previously it dead-ended with "press
+    // Download first" for any sound that was not local yet.
+    if (transport.isPlaying() && playingFileId == selectedFile.id)
     {
         pausePreview();
         return;
     }
-    if (previewSource != nullptr)
+    if (hasSelection)
     {
-        transport.start();
-        syncPlayerState();
+        playRowFile (selectedFile);
         return;
     }
-    if (hasSelection && selectedLocalExists)
-    {
-        loadPreview (selectedLocalFile);
-        transport.start();
-        playingFileId = selectedFile.id;
-        syncPlayerState();
-        return;
-    }
-    setError ("No preview loaded - press Download on a sound first.");
+    setError ("No preview loaded - select a sound first.");
 }
 
 void OnorabAudioProcessorEditor::setPreviewGain (float gain)
@@ -3100,6 +3111,40 @@ void OnorabAudioProcessorEditor::retryPushUpload (const juce::String& instanceId
     }
 }
 
+void OnorabAudioProcessorEditor::toggleTakePreview (const juce::String& instanceId)
+{
+    for (const auto& ts : pushTakes)
+    {
+        if (ts.take.instanceId == instanceId && ts.take.file.existsAsFile())
+        {
+            playTakePreview (instanceId, ts.take.file);
+            return;
+        }
+    }
+}
+
+void OnorabAudioProcessorEditor::playTakePreview (const juce::String& instanceId,
+                                                  const juce::File& file)
+{
+    // Same transport as the Library preview: pressing a row's Play
+    // while its take plays pauses (transport.stop keeps the playhead,
+    // so pressing again resumes); a different take, or a take after a
+    // Library preview, reloads the source.
+    if (transport.isPlaying() && playingTakeId == instanceId)
+    {
+        pausePreview();
+        refreshTracksTab();
+        return;
+    }
+    if (playingTakeId != instanceId || previewSource == nullptr)
+        loadPreview (file);
+    transport.start();
+    playingTakeId = instanceId;
+    playingFileId.clear();
+    syncPlayerState();
+    refreshTracksTab();
+}
+
 void OnorabAudioProcessorEditor::onPushSelected()
 {
     if (pushPhase != PushPhase::Idle && pushPhase != PushPhase::Done)
@@ -3165,6 +3210,14 @@ void OnorabAudioProcessorEditor::onPushSelected()
         pushProject = project;
         pushIdCurrent = session.getPushId();
         pushTakes.clear();
+        // A take preview must not outlive its take: stop it before
+        // the new Push replaces the take list (a Library preview is
+        // untouched — playingTakeId is empty while one plays).
+        if (playingTakeId.isNotEmpty())
+        {
+            transport.stop();
+            playingTakeId.clear();
+        }
         pushPhase = PushPhase::Armed;
         pushRecordStartSeen = false;
         pushNotice.clear();
@@ -3420,6 +3473,11 @@ void OnorabAudioProcessorEditor::refreshTracksTab()
         }
         row.canRetry = hasTake && takeIt->uploadStarted
             && getTransferStatus (takeIt->transferEntry) == "Failed";
+        // Previewable exactly when the finished take's WAV is still
+        // in the local cache: that file is the very audio the Push
+        // uploads, so playing it answers "is this the right audio?".
+        row.canPlay = hasTake && takeIt->take.file.existsAsFile();
+        row.isPlaying = row.canPlay && playingTakeId == id && transport.isPlaying();
         view.rows.push_back (row);
     }
 
