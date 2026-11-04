@@ -1,6 +1,6 @@
-# Onorab VST3 plugin — CMake build.
+# Onorab VST3 plugin - CMake build.
 #
-# Pinned dependency: JUCE 8.0.8 (FetchContent, tag — never an unversioned
+# Pinned dependency: JUCE 8.0.8 (FetchContent, tag - never an unversioned
 # branch). This project is built by GitHub Actions on a Windows runner, so
 # the user does NOT need Visual Studio installed locally to get a .vst3.
 # A developer who does have VS 2022 can still build locally with the same
@@ -47,8 +47,6 @@ juce_add_plugin(Onorab
     VST3_CATEGORIES "Fx"
 )
 
-juce_generate_juce_header(Onorab)
-
 target_sources(Onorab
     PRIVATE
         Source/PluginProcessor.cpp
@@ -56,6 +54,15 @@ target_sources(Onorab
         Source/HubClient.cpp
         Source/WaveformView.cpp
 )
+
+# MSVC reads source files in the local codepage by default, which turned
+# UTF-8 punctuation in UI strings into mojibake ("a" with accents) in
+# the built plugin. /utf-8 makes string literals mean what the source
+# says. The redesign also keeps all new UI strings plain ASCII, so the
+# fix does not depend on this flag alone.
+if (MSVC)
+    target_compile_options(Onorab PRIVATE /utf-8)
+endif()
 
 target_compile_definitions(Onorab
     PRIVATE

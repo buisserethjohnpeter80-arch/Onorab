@@ -1,33 +1,65 @@
-// OnorabAudioProcessorEditor implementation. See PluginEditor.h for the
-// threading and drag-and-drop notes. All Hub interaction goes through
-// HubClient (background thread) and all UI updates run on the message
-// thread. No network, file I/O or allocation for audio happens here that
-// could reach the real-time thread — this file never touches processBlock.
+// OnorabAudioProcessorEditor implementation (redesign 2026-11-04).
+// See PluginEditor.h for the design notes, the honest drag-and-drop
+// contract and the ASCII-only text rule. All Hub interaction goes
+// through HubClient (background thread) and all UI updates run on the
+// message thread. No network, file I/O or allocation for audio happens
+// here that could reach the real-time thread - this file never touches
+// processBlock.
 
 #include "PluginEditor.h"
 #include "PluginProcessor.h"
+#include <algorithm>
 
 namespace
 {
-const juce::Colour kGraphite (0xff14171c);
-const juce::Colour kPanel (0xff1a1d22);
-const juce::Colour kCyan (0xff22d3ee);
-const juce::Colour kViolet (0xff8b5cf6);
+// Palette from the reference mockup: near-black background, dark panels,
+// light readable text, light purple for selection and primary actions.
+const juce::Colour kBackground (0xff0c0c0f);
+const juce::Colour kPanel (0xff16161b);
+const juce::Colour kPanel2 (0xff1e1e24);
+const juce::Colour kSelected (0xff2e2440);
+const juce::Colour kPurple (0xffb7a6ff); // light purple: primary actions
+const juce::Colour kPurpleDark (0xff8b5cf6);
+const juce::Colour kText (0xfff2f2f5);
+const juce::Colour kTextDim (0xffa1a1aa);
 const juce::Colour kGreen (0xff22c55e);
 const juce::Colour kRed (0xffef4444);
+const juce::Colour kGrey (0xff71717a);
 
-void styleButton (juce::TextButton& button, juce::Colour accent = kCyan)
+void styleButton (juce::TextButton& button, juce::Colour textColour = kText)
 {
-    button.setColour (juce::TextButton::buttonColourId, kPanel);
-    button.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
-    button.setColour (juce::TextButton::textColourOnId, accent);
+    button.setColour (juce::TextButton::buttonColourId, kPanel2);
+    button.setColour (juce::TextButton::textColourOffId, textColour);
+    button.setColour (juce::TextButton::textColourOnId, textColour);
 }
 
-void styleLabel (juce::Label& label, juce::Colour colour = juce::Colours::white, float size = 13.0f)
+void stylePrimaryButton (juce::TextButton& button)
+{
+    button.setColour (juce::TextButton::buttonColourId, kPurple);
+    button.setColour (juce::TextButton::textColourOffId, juce::Colours::black);
+    button.setColour (juce::TextButton::textColourOnId, juce::Colours::black);
+}
+
+void styleLabel (juce::Label& label, juce::Colour colour = kText, float size = 13.0f)
 {
     label.setColour (juce::Label::textColourId, colour);
     label.setFont (juce::Font (juce::FontOptions (size)));
     label.setJustificationType (juce::Justification::left);
+}
+
+void styleSearchBox (juce::TextEditor& box, const juce::String& emptyText)
+{
+    box.setTextToShowWhenEmpty (emptyText, kGrey);
+    box.setColour (juce::TextEditor::backgroundColourId, kPanel2);
+    box.setColour (juce::TextEditor::textColourId, kText);
+    box.setColour (juce::TextEditor::outlineColourId, kPanel2);
+    box.setColour (juce::TextEditor::focusedOutlineColourId, kPurpleDark);
+    box.setFont (juce::Font (juce::FontOptions (13.0f)));
+}
+
+void styleTextBox (juce::TextEditor& box, const juce::String& emptyText)
+{
+    styleSearchBox (box, emptyText);
 }
 
 juce::String formatBytes (int64_t bytes)
@@ -39,6 +71,15 @@ juce::String formatBytes (int64_t bytes)
     return juce::String (bytes / (1024.0 * 1024.0), 1) + " MB";
 }
 
+juce::String formatDuration (double seconds)
+{
+    if (seconds < 0)
+        return "--:--";
+    const int total = static_cast<int> (seconds + 0.5);
+    return juce::String (total / 60) + ":"
+         + juce::String (total % 60).paddedLeft ('0', 2);
+}
+
 bool isAudioFile (const juce::String& path)
 {
     static const juce::StringArray exts { "wav", "mp3", "flac", "aiff", "aif", "ogg", "m4a" };
@@ -46,37 +87,84 @@ bool isAudioFile (const juce::String& path)
 }
 } // namespace
 
-// ============================== DragSourceComponent ======================
+// ============================== IconButton ==============================
 
-void DragSourceComponent::paint (juce::Graphics& g)
+void IconButton::setPauseIcon (bool isPause)
 {
-    g.fillAll (kViolet.withAlpha (0.25f));
-    g.setColour (kViolet);
-    g.drawRect (getLocalBounds(), 1);
-    g.setColour (juce::Colours::white);
-    g.setFont (13.0f);
-    g.drawFittedText ("Drag to FL — drag this box into FL Studio",
-                      getLocalBounds().reduced (6), juce::Justification::centred, 2);
+    pauseIcon = isPause;
+    repaint();
 }
 
-void DragSourceComponent::mouseDrag (const juce::MouseEvent&)
+void IconButton::setStopIcon (bool isStop)
 {
-    if (isDragging || getFilesToDrag == nullptr)
-        return;
+    stopIcon = isStop;
+    repaint();
+}
 
-    // Only real, existing local files are handed out. Nothing taken
-    // yet means nothing to drag — never an empty or missing path.
+void IconButton::paint (juce::Graphics& g)
+{
+    auto area = getLocalBounds().toFloat();
+    g.setColour (kPurple);
+    g.fillEllipse (area);
+    g.setColour (juce::Colours::black);
+    if (stopIcon)
+    {
+        const float w = area.getWidth(), h = area.getHeight();
+        g.fillRect (area.getX() + w * 0.32f, area.getY() + h * 0.32f, w * 0.36f, h * 0.36f);
+    }
+    else if (pauseIcon)
+    {
+        const float w = area.getWidth(), h = area.getHeight();
+        g.fillRect (area.getX() + w * 0.32f, area.getY() + h * 0.28f, w * 0.13f, h * 0.44f);
+        g.fillRect (area.getX() + w * 0.55f, area.getY() + h * 0.28f, w * 0.13f, h * 0.44f);
+    }
+    else
+    {
+        juce::Path triangle;
+        const float x = area.getX(), y = area.getY(), w = area.getWidth(), h = area.getHeight();
+        triangle.addTriangle (x + w * 0.36f, y + h * 0.26f,
+                              x + w * 0.36f, y + h * 0.74f,
+                              x + w * 0.74f, y + h * 0.50f);
+        g.fillPath (triangle);
+    }
+}
+
+void IconButton::mouseUp (const juce::MouseEvent& event)
+{
+    if (event.mouseWasClicked() && onClick != nullptr)
+        onClick();
+}
+
+// ============================== DragGrip ==============================
+
+void DragGrip::setEnabledGrip (bool enabled)
+{
+    gripEnabled = enabled;
+    repaint();
+}
+
+void DragGrip::paint (juce::Graphics& g)
+{
+    g.setColour (gripEnabled ? kPurple : kGrey);
+    for (int row = 0; row < 3; ++row)
+        for (int col = 0; col < 2; ++col)
+            g.fillEllipse (3.0f + static_cast<float> (col) * 6.0f,
+                           5.0f + static_cast<float> (row) * 8.0f, 3.0f, 3.0f);
+}
+
+void DragGrip::mouseDrag (const juce::MouseEvent&)
+{
+    if (isDragging || getFilesToDrag == nullptr || ! gripEnabled)
+        return;
     juce::StringArray files;
     for (const auto& path : getFilesToDrag())
         if (juce::File (path).existsAsFile())
             files.add (path);
     if (files.isEmpty())
         return;
-
     auto* container = findParentComponentOfClass<juce::DragAndDropContainer>();
     if (container == nullptr)
         return;
-
     // Hand the host real file paths. Whether FL Studio accepts the drop
     // is the host's decision (see the header note); this call is the
     // plugin's side of the contract, and it blocks until the drag ends.
@@ -84,6 +172,210 @@ void DragSourceComponent::mouseDrag (const juce::MouseEvent&)
     container->performExternalDragDropOfFiles (files, false);
     isDragging = false;
 }
+
+// ============================== StatusDot ==============================
+
+void StatusDot::setDotColour (juce::Colour colour)
+{
+    dotColour = colour;
+    repaint();
+}
+
+void StatusDot::paint (juce::Graphics& g)
+{
+    g.setColour (dotColour);
+    g.fillEllipse (getLocalBounds().toFloat().reduced (2.0f));
+}
+
+// ============================== Library row ==============================
+
+// One Library row: drag grip, play button, name, size, and the status
+// area (Download button, Downloading progress, or Ready for FL).
+// The row never invents data: size comes from the Hub, the local state
+// from the editor's cache check, progress from the real download.
+class LibraryRowComponent : public juce::Component
+{
+public:
+    struct State
+    {
+        CloudFile file;
+        bool isLocal = false;
+        bool isPlaying = false;
+        bool isSelected = false;
+        bool downloading = false;
+        double progress = -1.0; // 0..1, or < 0 when unknown
+        std::function<void()> onPlay;
+        std::function<void()> onDownload;
+        std::function<juce::StringArray()> getDragFiles;
+    };
+
+    LibraryRowComponent()
+    {
+        playButton.onClick = [this] { if (onPlay != nullptr) onPlay(); };
+        addAndMakeVisible (playButton);
+        grip.getFilesToDrag = [this]
+        {
+            if (getDragFiles != nullptr)
+                return getDragFiles();
+            return juce::StringArray {};
+        };
+        addAndMakeVisible (grip);
+        styleLabel (nameLabel, kText, 13.0f);
+        addAndMakeVisible (nameLabel);
+        styleLabel (metaLabel, kTextDim, 12.0f);
+        metaLabel.setJustificationType (juce::Justification::right);
+        addAndMakeVisible (metaLabel);
+        styleButton (downloadButton, kPurple);
+        downloadButton.onClick = [this] { if (onDownload != nullptr) onDownload(); };
+        addAndMakeVisible (downloadButton);
+        styleLabel (statusLabel, kGreen, 12.0f);
+        addAndMakeVisible (statusLabel);
+    }
+
+    void update (const State& state)
+    {
+        onPlay = state.onPlay;
+        onDownload = state.onDownload;
+        getDragFiles = state.getDragFiles;
+        selected = state.isSelected;
+        playButton.setPauseIcon (state.isPlaying);
+        grip.setEnabledGrip (state.isLocal);
+        nameLabel.setText (state.file.name, juce::NotificationType::dontSendNotification);
+        metaLabel.setText (formatBytes (state.file.sizeBytes),
+                           juce::NotificationType::dontSendNotification);
+        if (state.isLocal)
+        {
+            downloadButton.setVisible (false);
+            statusLabel.setVisible (true);
+            statusLabel.setText ("Ready for FL", juce::NotificationType::dontSendNotification);
+            statusLabel.setColour (juce::Label::textColourId, kGreen);
+            progressVisible = false;
+        }
+        else if (state.downloading)
+        {
+            downloadButton.setVisible (false);
+            statusLabel.setVisible (true);
+            statusLabel.setText (state.progress >= 0
+                                     ? "Downloading " + juce::String (static_cast<int> (state.progress * 100.0)) + "%"
+                                     : "Downloading...",
+                                 juce::NotificationType::dontSendNotification);
+            statusLabel.setColour (juce::Label::textColourId, kTextDim);
+            progressVisible = state.progress >= 0;
+            progressValue = state.progress >= 0 ? state.progress : 0.0;
+        }
+        else
+        {
+            downloadButton.setVisible (true);
+            downloadButton.setButtonText ("Download");
+            statusLabel.setVisible (false);
+            progressVisible = false;
+        }
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        if (selected)
+            g.fillAll (kSelected);
+        if (progressVisible)
+        {
+            g.setColour (kPanel2);
+            g.fillRect (0, getHeight() - 3, getWidth(), 3);
+            g.setColour (kPurple);
+            g.fillRect (0, getHeight() - 3,
+                        static_cast<int> (static_cast<double> (getWidth()) * progressValue), 3);
+        }
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced (4, 3);
+        grip.setBounds (area.removeFromLeft (16));
+        area.removeFromLeft (4);
+        playButton.setBounds (area.removeFromLeft (28));
+        area.removeFromLeft (8);
+        auto statusArea = area.removeFromRight (130);
+        downloadButton.setBounds (statusArea);
+        statusLabel.setBounds (statusArea);
+        area.removeFromRight (8);
+        metaLabel.setBounds (area.removeFromRight (80));
+        nameLabel.setBounds (area);
+    }
+
+private:
+    DragGrip grip;
+    IconButton playButton;
+    juce::Label nameLabel, metaLabel, statusLabel;
+    juce::TextButton downloadButton { "Download" };
+    std::function<void()> onPlay, onDownload;
+    std::function<juce::StringArray()> getDragFiles;
+    bool selected = false;
+    bool progressVisible = false;
+    double progressValue = 0.0;
+};
+
+// ============================== Transfer row ==============================
+
+class TransferRowComponent : public juce::Component
+{
+public:
+    TransferRowComponent()
+    {
+        styleLabel (nameLabel, kText, 13.0f);
+        addAndMakeVisible (nameLabel);
+        styleLabel (infoLabel, kTextDim, 12.0f);
+        addAndMakeVisible (infoLabel);
+        styleLabel (errorLabel, kRed, 12.0f);
+        addAndMakeVisible (errorLabel);
+        styleButton (retryButton, kPurple);
+        retryButton.onClick = [this] { if (onRetry != nullptr) onRetry(); };
+        addAndMakeVisible (retryButton);
+    }
+
+    void update (const TransferRow& row, std::function<void()> retry)
+    {
+        onRetry = std::move (retry);
+        nameLabel.setText (row.fileName, juce::NotificationType::dontSendNotification);
+        infoLabel.setText ((row.direction.isNotEmpty() ? row.direction : "Transfer")
+                               + " - " + row.status,
+                           juce::NotificationType::dontSendNotification);
+        const bool failed = row.status == "Failed";
+        errorLabel.setVisible (failed && row.error.isNotEmpty());
+        errorLabel.setText (row.error, juce::NotificationType::dontSendNotification);
+        retryButton.setVisible (row.canRetry);
+        retryButton.setButtonText ("Retry");
+        progressValue = juce::jlimit (0.0, 1.0, row.progress);
+        done = row.status == "Done";
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        // Progress bar along the bottom of the row.
+        g.setColour (kPanel2);
+        g.fillRect (0, getHeight() - 3, getWidth(), 3);
+        g.setColour (done ? kGreen : kPurple);
+        g.fillRect (0, getHeight() - 3,
+                    static_cast<int> (static_cast<double> (getWidth()) * progressValue), 3);
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced (4, 3);
+        auto right = area.removeFromRight (90);
+        retryButton.setBounds (right);
+        nameLabel.setBounds (area.removeFromTop (18));
+        infoLabel.setBounds (area.removeFromTop (16));
+        errorLabel.setBounds (area);
+    }
+
+private:
+    juce::Label nameLabel, infoLabel, errorLabel;
+    juce::TextButton retryButton { "Retry" };
+    std::function<void()> onRetry;
+    double progressValue = 0.0;
+    bool done = false;
+};
 
 // ============================== LibraryTab ==============================
 
@@ -93,44 +385,15 @@ LibraryTab::LibraryTab (OnorabAudioProcessorEditor& editorIn)
 {
     waveformFormatManager.registerBasicFormats();
 
-    searchBox.setTextToShowWhenEmpty ("Search files…", juce::Colours::grey);
+    styleSearchBox (searchBox, "Search sounds...");
     searchBox.addListener (this);
     addAndMakeVisible (searchBox);
-
-    styleLabel (syncLabel, juce::Colours::lightgrey);
-    syncLabel.setText ("Hub: checking…", juce::NotificationType::dontSendNotification);
-    addAndMakeVisible (syncLabel);
-
-    styleLabel (errorLabel, kRed);
-    addAndMakeVisible (errorLabel);
-    styleLabel (progressLabel, kGreen);
-    addAndMakeVisible (progressLabel);
-    styleLabel (captureLabel, juce::Colours::lightgrey);
-    addAndMakeVisible (captureLabel);
-    styleLabel (dragHintLabel, juce::Colours::grey, 12.0f);
-    dragHintLabel.setText ("Tip: take a file first, then drag the violet box into FL Studio.",
-                           juce::NotificationType::dontSendNotification);
-    addAndMakeVisible (dragHintLabel);
-
-    fileList.setRowHeight (22);
-    fileList.setMultipleSelectionEnabled (true); // Take one or more sounds.
-    addAndMakeVisible (fileList);
-
-    addAndMakeVisible (waveform);
 
     styleButton (refreshButton);
     refreshButton.onClick = [this] { owner.refreshFiles(); };
     addAndMakeVisible (refreshButton);
 
-    styleButton (takeButton, kCyan);
-    takeButton.onClick = [this] { owner.takeSelectedFiles(); };
-    addAndMakeVisible (takeButton);
-
-    styleButton (deleteButton, kRed);
-    deleteButton.onClick = [this] { owner.deleteHubFiles (getSelectedFiles()); };
-    addAndMakeVisible (deleteButton);
-
-    styleButton (uploadButton, kViolet);
+    styleButton (uploadButton, kPurple);
     uploadButton.onClick = [this]
     {
         fileChooser = std::make_unique<juce::FileChooser> ("Choose an audio file to upload",
@@ -145,61 +408,64 @@ LibraryTab::LibraryTab (OnorabAudioProcessorEditor& editorIn)
     };
     addAndMakeVisible (uploadButton);
 
-    styleButton (uploadCaptureButton, kGreen);
-    uploadCaptureButton.onClick = [this] { owner.uploadLastCapture(); };
-    addAndMakeVisible (uploadCaptureButton);
+    styleButton (deleteButton, kRed);
+    deleteButton.onClick = [this]
+    {
+        if (const int row = fileList.getSelectedRow(); row >= 0
+            && row < static_cast<int> (filteredFiles.size()))
+            owner.deleteHubFiles ({ filteredFiles[static_cast<size_t> (row)] });
+    };
+    addAndMakeVisible (deleteButton);
 
-    styleButton (playButton, kGreen);
-    playButton.onClick = [this] { owner.playPreview(); };
-    addAndMakeVisible (playButton);
-    styleButton (pauseButton);
-    pauseButton.onClick = [this] { owner.pausePreview(); };
-    addAndMakeVisible (pauseButton);
-    styleButton (stopButton);
-    stopButton.onClick = [this] { owner.stopPreview(); };
-    addAndMakeVisible (stopButton);
+    styleLabel (messageLabel, kTextDim, 12.0f);
+    addAndMakeVisible (messageLabel);
+    styleLabel (errorLabel, kRed, 12.0f);
+    addAndMakeVisible (errorLabel);
 
+    styleLabel (emptyLabel, kTextDim, 14.0f);
+    emptyLabel.setJustificationType (juce::Justification::centred);
+    addAndMakeVisible (emptyLabel);
+    stylePrimaryButton (emptyCaptureButton);
+    emptyCaptureButton.onClick = [this] { owner.startCapture(); };
+    addAndMakeVisible (emptyCaptureButton);
+
+    fileList.setRowHeight (34);
+    fileList.setMultipleSelectionEnabled (false);
+    addAndMakeVisible (fileList);
+
+    // Player card for the selected sound.
+    styleLabel (playerNameLabel, kText, 14.0f);
+    playerNameLabel.setText ("No sound selected", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (playerNameLabel);
+    addAndMakeVisible (waveform);
+    playerPlayButton.onClick = [this] { owner.togglePlayerPlay(); };
+    addAndMakeVisible (playerPlayButton);
+    playerStopButton.onClick = [this] { owner.stopPreview(); };
+    playerStopButton.setStopIcon (true);
+    addAndMakeVisible (playerStopButton);
+    styleLabel (timeLabel, kTextDim, 12.0f);
+    timeLabel.setText ("0:00 / 0:00", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (timeLabel);
+    styleLabel (playerHintLabel, kTextDim, 12.0f);
+    addAndMakeVisible (playerHintLabel);
     gainSlider.setRange (0.0, 1.0, 0.01);
     gainSlider.setValue (0.8);
     gainSlider.onValueChange = [this] { owner.setPreviewGain (static_cast<float> (gainSlider.getValue())); };
     addAndMakeVisible (gainSlider);
-    styleLabel (gainLabel, juce::Colours::lightgrey, 12.0f);
-    gainLabel.setText ("Preview gain", juce::NotificationType::dontSendNotification);
+    styleLabel (gainLabel, kTextDim, 12.0f);
+    gainLabel.setText ("Volume", juce::NotificationType::dontSendNotification);
     addAndMakeVisible (gainLabel);
 
-    styleButton (captureButton, kRed);
-    captureButton.onClick = [this] { owner.toggleCapture(); };
-    addAndMakeVisible (captureButton);
-
-    // Onorab Bus support (user logic, 2026-11-03): the plugin CANNOT
-    // create an FL Mixer track or route FL tracks — FL Studio owns its
-    // Mixer. What the plugin CAN do is name a capture after the routed
-    // track, so a routed track-by-track capture stays identifiable
-    // when it is uploaded / pushed to a project.
-    captureNameBox.setTextToShowWhenEmpty ("Capture name, e.g. Vocal (empty = auto name)", juce::Colours::grey);
-    addAndMakeVisible (captureNameBox);
-
-    styleLabel (busGuideLabel, juce::Colours::grey, 12.0f);
-    busGuideLabel.setText ("Onorab Bus: one Mixer track for Onorab, Route this track per track, then Capture.",
-                           juce::NotificationType::dontSendNotification);
-    addAndMakeVisible (busGuideLabel);
-
-    dragSource.getFilesToDrag = [this]
-    {
-        if (! takenLocalFiles.isEmpty())
-            return takenLocalFiles;
-        if (selectedLocalExists)
-            return juce::StringArray { selectedLocalFile.getFullPathName() };
-        return juce::StringArray {};
-    };
-    addAndMakeVisible (dragSource);
+    updateEmptyState();
 }
 
 LibraryTab::~LibraryTab() = default;
 
-void LibraryTab::setFiles (const std::vector<CloudFile>& files)
+void LibraryTab::setFiles (const std::vector<CloudFile>& files,
+                           const std::vector<juce::String>& localFileIds)
 {
     allFiles = files;
+    localIds = localFileIds;
     applySearchFilter();
 }
 
@@ -212,6 +478,20 @@ void LibraryTab::applySearchFilter()
             filteredFiles.push_back (f);
     fileList.updateContent();
     fileList.repaint();
+    updateEmptyState();
+}
+
+void LibraryTab::updateEmptyState()
+{
+    const bool libraryEmpty = allFiles.empty();
+    const bool searchEmpty = ! libraryEmpty && filteredFiles.empty();
+    emptyLabel.setVisible (libraryEmpty || searchEmpty);
+    emptyCaptureButton.setVisible (libraryEmpty);
+    if (libraryEmpty)
+        emptyLabel.setText ("No sounds yet", juce::NotificationType::dontSendNotification);
+    else if (searchEmpty)
+        emptyLabel.setText ("No sounds match your search.", juce::NotificationType::dontSendNotification);
+    fileList.setVisible (! libraryEmpty);
 }
 
 void LibraryTab::textEditorTextChanged (juce::TextEditor&)
@@ -219,10 +499,48 @@ void LibraryTab::textEditorTextChanged (juce::TextEditor&)
     applySearchFilter();
 }
 
-void LibraryTab::setSyncStatus (const juce::String& text, bool connected)
+void LibraryTab::setSelected (const CloudFile& file, bool localExists)
 {
-    syncLabel.setText ("Hub: " + text, juce::NotificationType::dontSendNotification);
-    syncLabel.setColour (juce::Label::textColourId, connected ? kGreen : kRed);
+    selectedId = file.id;
+    (void) localExists;
+    fileList.updateContent();
+    fileList.repaint();
+}
+
+void LibraryTab::clearSelection()
+{
+    selectedId.clear();
+    playingId.clear();
+    fileList.deselectAllRows();
+    setPlayer ("No sound selected", juce::File {}, false, -1.0);
+}
+
+void LibraryTab::setDownloadProgress (const juce::String& fileId, double progress, bool isDownloading)
+{
+    if (isDownloading)
+    {
+        downloading[fileId] = true;
+        downloadProgress[fileId] = progress;
+    }
+    else
+    {
+        downloading.erase (fileId);
+        downloadProgress.erase (fileId);
+    }
+    fileList.updateContent();
+    fileList.repaint();
+}
+
+void LibraryTab::setPlaying (const juce::String& fileId, bool playing)
+{
+    playingId = playing ? fileId : juce::String {};
+    fileList.updateContent();
+    fileList.repaint();
+}
+
+void LibraryTab::setMessage (const juce::String& text)
+{
+    messageLabel.setText (text, juce::NotificationType::dontSendNotification);
 }
 
 void LibraryTab::setError (const juce::String& text)
@@ -232,127 +550,86 @@ void LibraryTab::setError (const juce::String& text)
         DBG ("Onorab UI error: " << text);
 }
 
-void LibraryTab::setProgress (const juce::String& text)
+void LibraryTab::setPlayer (const juce::String& name, const juce::File& localFile,
+                            bool localExists, double durationSeconds)
 {
-    progressLabel.setText (text, juce::NotificationType::dontSendNotification);
-}
-
-void LibraryTab::setCapturing (bool isCapturing)
-{
-    capturing = isCapturing;
-    captureButton.setButtonText (isCapturing ? "Stop capture" : "Capture from FL");
-    if (! isCapturing)
-        captureLabel.setText ("Capture stopped.", juce::NotificationType::dontSendNotification);
-}
-
-void LibraryTab::setCaptureNote (const juce::String& text)
-{
-    captureLabel.setText (text, juce::NotificationType::dontSendNotification);
-}
-
-void LibraryTab::setSelectedLocalFile (const juce::File& file, bool exists)
-{
-    selectedLocalFile = file;
-    selectedLocalExists = exists;
-    waveform.setFile (file); // Shows a placeholder when the file is not local yet.
-    updateDragHint();
-}
-
-juce::String LibraryTab::getCaptureName() const
-{
-    return captureNameBox.getText().trim();
-}
-
-void LibraryTab::setTakenLocalFiles (const juce::StringArray& files)
-{
-    takenLocalFiles = files;
-    updateDragHint();
-}
-
-std::vector<CloudFile> LibraryTab::getSelectedFiles() const
-{
-    std::vector<CloudFile> out;
-    // juce::SparseSet has no begin()/end() iterators, so a range-for
-    // over getSelectedRows() does not compile (MSVC C3312). Index it:
-    // rows[i] is the i-th selected row, rows.size() the count.
-    const juce::SparseSet<int> rows = fileList.getSelectedRows();
-    for (int i = 0; i < rows.size(); ++i)
+    playerNameLabel.setText (name, juce::NotificationType::dontSendNotification);
+    if (name == "No sound selected")
     {
-        const int row = rows[i];
-        if (row >= 0 && row < static_cast<int> (filteredFiles.size()))
-            out.push_back (filteredFiles[static_cast<size_t> (row)]);
+        waveform.clear();
+        playerHintLabel.setText ("Select a sound to preview it.",
+                                 juce::NotificationType::dontSendNotification);
     }
-    return out;
+    else if (localExists)
+    {
+        waveform.setFile (localFile);
+        playerHintLabel.setText ("Drag the handle on this row into the FL Playlist.",
+                                 juce::NotificationType::dontSendNotification);
+    }
+    else
+    {
+        waveform.setFile (localFile); // Placeholder when the file is not local yet.
+        playerHintLabel.setText ("Press Download on this sound to fetch it to this computer.",
+                                 juce::NotificationType::dontSendNotification);
+    }
+    timeLabel.setText ("0:00 / " + formatDuration (durationSeconds),
+                       juce::NotificationType::dontSendNotification);
 }
 
-void LibraryTab::updateDragHint()
+void LibraryTab::setPlayerPosition (double currentSeconds, double totalSeconds)
 {
-    if (! takenLocalFiles.isEmpty())
-    {
-        dragHintLabel.setText ("Ready to drag: " + juce::String (takenLocalFiles.size())
-                                   + (takenLocalFiles.size() == 1 ? " file" : " files"),
-                               juce::NotificationType::dontSendNotification);
-        return;
-    }
-    dragHintLabel.setText (selectedLocalExists
-                               ? "Ready to drag: " + selectedLocalFile.getFileName()
-                               : "Tip: take a file first, then drag the violet box into FL Studio.",
-                           juce::NotificationType::dontSendNotification);
+    timeLabel.setText (formatDuration (currentSeconds) + " / " + formatDuration (totalSeconds),
+                       juce::NotificationType::dontSendNotification);
+}
+
+void LibraryTab::setPlayerPlaying (bool playing)
+{
+    playerPlayButton.setPauseIcon (playing);
 }
 
 void LibraryTab::resized()
 {
-    auto area = getLocalBounds().reduced (8);
-    searchBox.setBounds (area.removeFromTop (26));
-    area.removeFromTop (4);
-    syncLabel.setBounds (area.removeFromTop (20));
-    area.removeFromTop (4);
-
-    auto buttonRow1 = area.removeFromTop (28);
-    refreshButton.setBounds (buttonRow1.removeFromLeft (90));
-    buttonRow1.removeFromLeft (6);
-    takeButton.setBounds (buttonRow1.removeFromLeft (140));
-    buttonRow1.removeFromLeft (6);
-    uploadButton.setBounds (buttonRow1.removeFromLeft (110));
-    buttonRow1.removeFromLeft (6);
-    uploadCaptureButton.setBounds (buttonRow1.removeFromLeft (170));
-    buttonRow1.removeFromLeft (6);
-    deleteButton.setBounds (buttonRow1.removeFromLeft (110));
-
+    auto area = getLocalBounds().reduced (12);
+    auto topRow = area.removeFromTop (30);
+    searchBox.setBounds (topRow.removeFromLeft (topRow.getWidth() - 220));
+    topRow.removeFromLeft (8);
+    refreshButton.setBounds (topRow.removeFromLeft (90));
+    topRow.removeFromLeft (8);
+    uploadButton.setBounds (topRow.removeFromLeft (110));
     area.removeFromTop (6);
-    fileList.setBounds (area.removeFromTop (100));
-    area.removeFromTop (6);
-    waveform.setBounds (area.removeFromTop (80));
-    area.removeFromTop (6);
-
-    auto transportRow = area.removeFromTop (28);
-    playButton.setBounds (transportRow.removeFromLeft (70));
-    transportRow.removeFromLeft (6);
-    pauseButton.setBounds (transportRow.removeFromLeft (70));
-    transportRow.removeFromLeft (6);
-    stopButton.setBounds (transportRow.removeFromLeft (70));
-    transportRow.removeFromLeft (12);
-    gainLabel.setBounds (transportRow.removeFromLeft (90));
-    gainSlider.setBounds (transportRow);
-
-    area.removeFromTop (6);
-    auto captureRow = area.removeFromTop (28);
-    captureButton.setBounds (captureRow.removeFromLeft (150));
-    captureRow.removeFromLeft (8);
-    captureLabel.setBounds (captureRow);
-
+    auto actionRow = area.removeFromTop (28);
+    deleteButton.setBounds (actionRow.removeFromLeft (110));
+    actionRow.removeFromLeft (8);
+    messageLabel.setBounds (actionRow);
     area.removeFromTop (4);
-    captureNameBox.setBounds (area.removeFromTop (26));
-    area.removeFromTop (4);
-    busGuideLabel.setBounds (area.removeFromTop (18));
-
-    area.removeFromTop (4);
-    dragSource.setBounds (area.removeFromTop (40));
-    area.removeFromTop (4);
-    dragHintLabel.setBounds (area.removeFromTop (18));
-    area.removeFromTop (4);
-    progressLabel.setBounds (area.removeFromTop (18));
     errorLabel.setBounds (area.removeFromTop (18));
+    area.removeFromTop (6);
+
+    // Player card at the bottom; the list takes the rest.
+    auto playerArea = area.removeFromBottom (168);
+    playerNameLabel.setBounds (playerArea.removeFromTop (20));
+    playerArea.removeFromTop (4);
+    waveform.setBounds (playerArea.removeFromTop (84));
+    playerArea.removeFromTop (6);
+    auto transportRow = playerArea.removeFromTop (28);
+    playerPlayButton.setBounds (transportRow.removeFromLeft (28));
+    transportRow.removeFromLeft (8);
+    playerStopButton.setBounds (transportRow.removeFromLeft (28));
+    transportRow.removeFromLeft (12);
+    timeLabel.setBounds (transportRow.removeFromLeft (110));
+    transportRow.removeFromLeft (12);
+    gainLabel.setBounds (transportRow.removeFromLeft (50));
+    gainSlider.setBounds (transportRow.removeFromLeft (120));
+    playerArea.removeFromTop (4);
+    playerHintLabel.setBounds (playerArea);
+
+    fileList.setBounds (area);
+    // Empty state overlays the list area.
+    auto emptyArea = area;
+    emptyLabel.setBounds (emptyArea.removeFromTop (24));
+    auto buttonRow = emptyArea.removeFromTop (32);
+    buttonRow.removeFromLeft ((buttonRow.getWidth() - 170) / 2);
+    emptyCaptureButton.setBounds (buttonRow.removeFromLeft (170));
 }
 
 int LibraryTab::getNumRows()
@@ -360,25 +637,45 @@ int LibraryTab::getNumRows()
     return static_cast<int> (filteredFiles.size());
 }
 
-void LibraryTab::paintListBoxItem (int rowNumber, juce::Graphics& g, int width, int height,
-                                   bool rowIsSelected)
+void LibraryTab::paintListBoxItem (int, juce::Graphics&, int, int, bool)
 {
+    // Rows are custom components (see refreshComponentForRow); nothing
+    // to paint here.
+}
+
+juce::Component* LibraryTab::refreshComponentForRow (int rowNumber, bool isRowSelected,
+                                                     juce::Component* existingComponentToUpdate)
+{
+    auto* row = dynamic_cast<LibraryRowComponent*> (existingComponentToUpdate);
+    if (row == nullptr)
+        row = new LibraryRowComponent();
     if (rowNumber < 0 || rowNumber >= static_cast<int> (filteredFiles.size()))
-        return;
-    const auto& file = filteredFiles[static_cast<size_t> (rowNumber)];
-    if (rowIsSelected)
-        g.fillAll (kCyan.withAlpha (0.2f));
-    // Project shown inline: "name  ·  project". Unassigned sounds show
-    // only their name, so old Hub files still render cleanly.
-    juce::String label = file.name;
-    if (file.projectId.isNotEmpty())
-        label += "  ·  " + file.projectId;
-    g.setColour (juce::Colours::white);
-    g.setFont (13.0f);
-    g.drawText (label, 6, 0, width - 110, height, juce::Justification::left, true);
-    g.setColour (juce::Colours::lightgrey);
-    g.drawText (formatBytes (file.sizeBytes), width - 100, 0, 94, height,
-                juce::Justification::right, true);
+        return row;
+    const CloudFile file = filteredFiles[static_cast<size_t> (rowNumber)];
+    const bool isLocal = std::find (localIds.begin(), localIds.end(), file.id) != localIds.end();
+    const auto dl = downloading.find (file.id);
+    const auto pr = downloadProgress.find (file.id);
+    LibraryRowComponent::State state;
+    state.file = file;
+    state.isLocal = isLocal;
+    state.isPlaying = (playingId == file.id);
+    state.isSelected = isRowSelected || (selectedId == file.id);
+    state.downloading = (dl != downloading.end() && dl->second);
+    state.progress = (pr != downloadProgress.end() ? pr->second : -1.0);
+    state.onPlay = [this, file] { owner.playRowFile (file); };
+    state.onDownload = [this, file] { owner.downloadFile (file); };
+    state.getDragFiles = [this, file, isLocal]
+    {
+        if (! isLocal)
+            return juce::StringArray {};
+        const juce::File local = owner.getCacheDir()
+                                     .getChildFile (HubClient::sanitiseFileName (file.name));
+        if (local.existsAsFile())
+            return juce::StringArray { local.getFullPathName() };
+        return juce::StringArray {};
+    };
+    row->update (state);
+    return row;
 }
 
 void LibraryTab::selectedRowsChanged (int lastRowSelected)
@@ -392,48 +689,34 @@ void LibraryTab::selectedRowsChanged (int lastRowSelected)
 ProjectsTab::ProjectsTab (OnorabAudioProcessorEditor& editorIn)
     : owner (editorIn)
 {
-    infoLabel.setText ("Projects live on Drive under Onorab_projet/<project>/ — "
-                       "type a project name to filter this list AND to target "
-                       "Upload / Push. FL Studio cannot list its own tracks "
-                       "automatically, so local sounds enter a project only "
-                       "through Upload or Push below.",
-                       juce::NotificationType::dontSendNotification);
-    infoLabel.setColour (juce::Label::textColourId, juce::Colours::white);
-    infoLabel.setFont (juce::Font (juce::FontOptions (13.0f)));
-    infoLabel.setJustificationType (juce::Justification::topLeft);
-    addAndMakeVisible (infoLabel);
+    styleLabel (titleLabel, kText, 14.0f);
+    titleLabel.setText ("Projects", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (titleLabel);
+    styleLabel (emptyLabel, kTextDim, 14.0f);
+    emptyLabel.setJustificationType (juce::Justification::centred);
+    emptyLabel.setText ("No projects yet", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (emptyLabel);
 
-    projectNameBox.setTextToShowWhenEmpty ("Project name, e.g. marcus music", juce::Colours::grey);
-    projectNameBox.addListener (this);
-    addAndMakeVisible (projectNameBox);
+    projectList.setRowHeight (30);
+    projectList.setMultipleSelectionEnabled (false);
+    addAndMakeVisible (projectList);
 
-    searchBox.setTextToShowWhenEmpty ("Search sounds in this project…", juce::Colours::grey);
-    searchBox.addListener (this);
-    addAndMakeVisible (searchBox);
+    styleButton (backButton, kPurple);
+    backButton.onClick = [this] { openProject.clear(); detailList.deselectAllRows(); updateView(); };
+    addAndMakeVisible (backButton);
+    styleLabel (detailTitleLabel, kText, 15.0f);
+    addAndMakeVisible (detailTitleLabel);
+    styleSearchBox (detailSearchBox, "Search sounds in this project...");
+    detailSearchBox.addListener (this);
+    addAndMakeVisible (detailSearchBox);
+    detailList.setRowHeight (26);
+    detailList.setMultipleSelectionEnabled (true); // Push / Delete one or more sounds.
+    addAndMakeVisible (detailList);
 
-    fileList.setRowHeight (22);
-    fileList.setMultipleSelectionEnabled (true); // Push one or more sounds.
-    addAndMakeVisible (fileList);
-
-    styleButton (uploadOneButton, kViolet);
-    uploadOneButton.onClick = [this]
+    stylePrimaryButton (addAudioButton);
+    addAudioButton.onClick = [this]
     {
-        fileChooser = std::make_unique<juce::FileChooser> ("Choose an audio file to upload to this project",
-                                                           juce::File(), "*.wav;*.mp3;*.flac;*.aiff;*.ogg;*.m4a");
-        fileChooser->launchAsync (juce::FileBrowserComponent::openMode
-                                      | juce::FileBrowserComponent::canSelectFiles,
-                                  [this] (const juce::FileChooser& chooser)
-                                  {
-                                      if (const juce::File f = chooser.getResult(); f.existsAsFile())
-                                          owner.uploadFilesToProject ({ f }, getProjectName());
-                                  });
-    };
-    addAndMakeVisible (uploadOneButton);
-
-    styleButton (uploadAllButton, kViolet);
-    uploadAllButton.onClick = [this]
-    {
-        fileChooser = std::make_unique<juce::FileChooser> ("Choose audio files to upload to this project",
+        fileChooser = std::make_unique<juce::FileChooser> ("Choose audio files to add to this project",
                                                            juce::File(), "*.wav;*.mp3;*.flac;*.aiff;*.ogg;*.m4a");
         fileChooser->launchAsync (juce::FileBrowserComponent::openMode
                                       | juce::FileBrowserComponent::canSelectFiles
@@ -444,122 +727,249 @@ ProjectsTab::ProjectsTab (OnorabAudioProcessorEditor& editorIn)
                                       for (const auto& f : chooser.getResults())
                                           if (f.existsAsFile())
                                               picked.push_back (f);
-                                      owner.uploadFilesToProject (picked, getProjectName());
+                                      owner.uploadFilesToProject (picked, openProject);
                                   });
     };
-    addAndMakeVisible (uploadAllButton);
-
+    addAndMakeVisible (addAudioButton);
+    styleButton (inviteButton, kPurple);
+    inviteButton.onClick = [this]
+    {
+        invitePanelVisible = true;
+        inviteProjectLabel.setText ("Invite to project: " + openProject,
+                                    juce::NotificationType::dontSendNotification);
+        inviteEmailBox.setText ("");
+        inviteStatusLabel.setText ("", juce::NotificationType::dontSendNotification);
+        updateView();
+    };
+    addAndMakeVisible (inviteButton);
     styleButton (pushButton, kGreen);
-    pushButton.onClick = [this] { owner.pushProjectFiles (getSelectedFiles(), getProjectName()); };
+    pushButton.onClick = [this] { owner.pushProjectFiles (getDetailSelectedFiles(), openProject); };
     addAndMakeVisible (pushButton);
-
     styleButton (deleteButton, kRed);
-    deleteButton.onClick = [this] { owner.deleteHubFiles (getSelectedFiles()); };
+    deleteButton.onClick = [this] { owner.deleteHubFiles (getDetailSelectedFiles()); };
     addAndMakeVisible (deleteButton);
 
-    styleLabel (noteLabel, juce::Colours::grey, 12.0f);
-    noteLabel.setText ("Push uploads the LOCAL copies of the selected sounds into "
-                       "Onorab_projet/<project>/. A sound with no local copy yet "
-                       "is skipped — Take it from the Cloud Library first.",
-                       juce::NotificationType::dontSendNotification);
-    addAndMakeVisible (noteLabel);
+    styleLabel (statusLabel, kTextDim, 12.0f);
+    addAndMakeVisible (statusLabel);
+
+    // Invite panel (hidden until Invite is pressed).
+    styleLabel (inviteProjectLabel, kText, 13.0f);
+    addAndMakeVisible (inviteProjectLabel);
+    styleTextBox (inviteEmailBox, "Invited Gmail, e.g. friend@gmail.com");
+    addAndMakeVisible (inviteEmailBox);
+    stylePrimaryButton (inviteSendButton);
+    inviteSendButton.onClick = [this]
+    {
+        owner.inviteToProject (inviteEmailBox.getText().trim(), openProject);
+    };
+    addAndMakeVisible (inviteSendButton);
+    styleButton (inviteCancelButton);
+    inviteCancelButton.onClick = [this] { invitePanelVisible = false; updateView(); };
+    addAndMakeVisible (inviteCancelButton);
+    styleLabel (inviteStatusLabel, kTextDim, 12.0f);
+    addAndMakeVisible (inviteStatusLabel);
+
+    updateView();
 }
 
 void ProjectsTab::setFiles (const std::vector<CloudFile>& files)
 {
     allFiles = files;
-    applyFilter();
-}
-
-void ProjectsTab::applyFilter()
-{
-    const juce::String projectQuery = projectNameBox.getText().trim().toLowerCase();
-    const juce::String query = searchBox.getText().trim().toLowerCase();
-    filteredFiles.clear();
+    projectNames.clear();
     for (const auto& f : allFiles)
     {
-        if (projectQuery.isNotEmpty() && ! f.projectId.toLowerCase().contains (projectQuery))
+        if (f.projectId.isEmpty())
+            continue;
+        if (std::find (projectNames.begin(), projectNames.end(), f.projectId) == projectNames.end())
+            projectNames.push_back (f.projectId);
+    }
+    applyDetailFilter();
+    updateView();
+}
+
+void ProjectsTab::applyDetailFilter()
+{
+    const juce::String query = detailSearchBox.getText().trim().toLowerCase();
+    detailFiles.clear();
+    for (const auto& f : allFiles)
+    {
+        if (f.projectId != openProject)
             continue;
         if (query.isNotEmpty() && ! f.name.toLowerCase().contains (query))
             continue;
-        filteredFiles.push_back (f);
+        detailFiles.push_back (f);
     }
-    fileList.updateContent();
-    fileList.repaint();
+    detailList.updateContent();
+    detailList.repaint();
+    projectList.updateContent();
+    projectList.repaint();
 }
 
 void ProjectsTab::textEditorTextChanged (juce::TextEditor&)
 {
-    applyFilter();
+    applyDetailFilter();
 }
 
-juce::String ProjectsTab::getProjectName() const
+void ProjectsTab::updateView()
 {
-    return projectNameBox.getText().trim();
+    const bool detail = openProject.isNotEmpty();
+    titleLabel.setVisible (! detail);
+    projectList.setVisible (! detail);
+    emptyLabel.setVisible (! detail && projectNames.empty());
+    backButton.setVisible (detail);
+    detailTitleLabel.setVisible (detail);
+    detailSearchBox.setVisible (detail);
+    detailList.setVisible (detail);
+    addAudioButton.setVisible (detail);
+    inviteButton.setVisible (detail);
+    pushButton.setVisible (detail);
+    deleteButton.setVisible (detail);
+    inviteProjectLabel.setVisible (detail && invitePanelVisible);
+    inviteEmailBox.setVisible (detail && invitePanelVisible);
+    inviteSendButton.setVisible (detail && invitePanelVisible);
+    inviteCancelButton.setVisible (detail && invitePanelVisible);
+    inviteStatusLabel.setVisible (detail && invitePanelVisible);
+    if (detail)
+    {
+        detailTitleLabel.setText (openProject, juce::NotificationType::dontSendNotification);
+        applyDetailFilter();
+    }
+    resized();
 }
 
-std::vector<CloudFile> ProjectsTab::getSelectedFiles() const
+void ProjectsTab::setStatus (const juce::String& text, bool isError)
+{
+    statusLabel.setText (text, juce::NotificationType::dontSendNotification);
+    statusLabel.setColour (juce::Label::textColourId, isError ? kRed : kTextDim);
+}
+
+void ProjectsTab::setInviteStatus (const juce::String& text)
+{
+    inviteStatusLabel.setText (text, juce::NotificationType::dontSendNotification);
+}
+
+std::vector<CloudFile> ProjectsTab::getDetailSelectedFiles() const
 {
     std::vector<CloudFile> out;
-    // Same SparseSet note as LibraryTab: no iterators, index it.
-    const juce::SparseSet<int> rows = fileList.getSelectedRows();
+    // juce::SparseSet has no begin()/end() iterators, so a range-for
+    // over getSelectedRows() does not compile (MSVC C3312). Index it:
+    // rows[i] is the i-th selected row, rows.size() the count.
+    const juce::SparseSet<int> rows = detailList.getSelectedRows();
     for (int i = 0; i < rows.size(); ++i)
     {
         const int row = rows[i];
-        if (row >= 0 && row < static_cast<int> (filteredFiles.size()))
-            out.push_back (filteredFiles[static_cast<size_t> (row)]);
+        if (row >= 0 && row < static_cast<int> (detailFiles.size()))
+            out.push_back (detailFiles[static_cast<size_t> (row)]);
     }
     return out;
 }
 
 int ProjectsTab::getNumRows()
 {
-    return static_cast<int> (filteredFiles.size());
+    // One model serves both lists. Only the visible list is laid out
+    // by JUCE, so returning the visible list's count is correct; the
+    // hidden list's rows are never painted.
+    if (openProject.isNotEmpty())
+        return static_cast<int> (detailFiles.size());
+    return static_cast<int> (projectNames.size());
 }
 
 void ProjectsTab::paintListBoxItem (int rowNumber, juce::Graphics& g, int width, int height,
                                     bool rowIsSelected)
 {
-    if (rowNumber < 0 || rowNumber >= static_cast<int> (filteredFiles.size()))
-        return;
-    const auto& file = filteredFiles[static_cast<size_t> (rowNumber)];
     if (rowIsSelected)
-        g.fillAll (kCyan.withAlpha (0.2f));
-    g.setColour (juce::Colours::white);
+        g.fillAll (kSelected);
+    g.setColour (kText);
     g.setFont (13.0f);
-    g.drawText (file.name, 6, 0, width - 110, height, juce::Justification::left, true);
-    g.setColour (juce::Colours::lightgrey);
-    g.drawText (formatBytes (file.sizeBytes), width - 100, 0, 94, height,
-                juce::Justification::right, true);
+    if (openProject.isNotEmpty())
+    {
+        if (rowNumber < 0 || rowNumber >= static_cast<int> (detailFiles.size()))
+            return;
+        const auto& file = detailFiles[static_cast<size_t> (rowNumber)];
+        g.drawText (file.name, 6, 0, width - 110, height, juce::Justification::left, true);
+        g.setColour (kTextDim);
+        g.drawText (formatBytes (file.sizeBytes), width - 100, 0, 94, height,
+                    juce::Justification::right, true);
+        return;
+    }
+    if (rowNumber < 0 || rowNumber >= static_cast<int> (projectNames.size()))
+        return;
+    const juce::String project = projectNames[static_cast<size_t> (rowNumber)];
+    int count = 0;
+    for (const auto& f : allFiles)
+        if (f.projectId == project)
+            ++count;
+    g.drawText (project, 6, 0, width - 110, height, juce::Justification::left, true);
+    g.setColour (kTextDim);
+    g.drawText (juce::String (count) + (count == 1 ? " sound" : " sounds"),
+                width - 100, 0, 94, height, juce::Justification::right, true);
 }
 
 void ProjectsTab::selectedRowsChanged (int lastRowSelected)
 {
-    if (lastRowSelected >= 0 && lastRowSelected < static_cast<int> (filteredFiles.size()))
-        owner.onFileSelected (filteredFiles[static_cast<size_t> (lastRowSelected)]);
+    if (openProject.isEmpty())
+    {
+        // Project list click: open the project detail view.
+        if (lastRowSelected >= 0 && lastRowSelected < static_cast<int> (projectNames.size()))
+        {
+            openProject = projectNames[static_cast<size_t> (lastRowSelected)];
+            projectList.deselectAllRows();
+            updateView();
+        }
+        return;
+    }
+    // Detail list click: select a sound (preview follows the Library
+    // selection, so nothing extra happens here).
+    if (lastRowSelected >= 0 && lastRowSelected < static_cast<int> (detailFiles.size()))
+        owner.onFileSelected (detailFiles[static_cast<size_t> (lastRowSelected)]);
 }
 
 void ProjectsTab::resized()
 {
-    auto area = getLocalBounds().reduced (8);
-    infoLabel.setBounds (area.removeFromTop (52));
+    auto area = getLocalBounds().reduced (12);
+    if (openProject.isEmpty())
+    {
+        titleLabel.setBounds (area.removeFromTop (22));
+        area.removeFromTop (4);
+        auto listArea = area.removeFromTop (area.getHeight() - 24);
+        projectList.setBounds (listArea);
+        emptyLabel.setBounds (listArea);
+        statusLabel.setBounds (area);
+        return;
+    }
+    auto headerRow = area.removeFromTop (30);
+    backButton.setBounds (headerRow.removeFromLeft (110));
+    headerRow.removeFromLeft (8);
+    detailTitleLabel.setBounds (headerRow);
     area.removeFromTop (6);
-    projectNameBox.setBounds (area.removeFromTop (26));
-    area.removeFromTop (4);
-    searchBox.setBounds (area.removeFromTop (26));
+    detailSearchBox.setBounds (area.removeFromTop (28));
     area.removeFromTop (6);
-    auto buttonRow = area.removeFromTop (28);
-    uploadOneButton.setBounds (buttonRow.removeFromLeft (120));
+    auto buttonRow = area.removeFromTop (30);
+    addAudioButton.setBounds (buttonRow.removeFromLeft (120));
     buttonRow.removeFromLeft (6);
-    uploadAllButton.setBounds (buttonRow.removeFromLeft (120));
+    inviteButton.setBounds (buttonRow.removeFromLeft (90));
     buttonRow.removeFromLeft (6);
     pushButton.setBounds (buttonRow.removeFromLeft (90));
     buttonRow.removeFromLeft (6);
     deleteButton.setBounds (buttonRow.removeFromLeft (110));
     area.removeFromTop (6);
-    fileList.setBounds (area.removeFromTop (180));
+    if (invitePanelVisible)
+    {
+        inviteProjectLabel.setBounds (area.removeFromTop (20));
+        area.removeFromTop (4);
+        inviteEmailBox.setBounds (area.removeFromTop (28));
+        area.removeFromTop (4);
+        auto inviteRow = area.removeFromTop (30);
+        inviteSendButton.setBounds (inviteRow.removeFromLeft (130));
+        inviteRow.removeFromLeft (6);
+        inviteCancelButton.setBounds (inviteRow.removeFromLeft (90));
+        area.removeFromTop (4);
+        inviteStatusLabel.setBounds (area.removeFromTop (18));
+        area.removeFromTop (6);
+    }
+    detailList.setBounds (area.removeFromTop (area.getHeight() - 24));
     area.removeFromTop (6);
-    noteLabel.setBounds (area.removeFromTop (36));
+    statusLabel.setBounds (area);
 }
 
 // ============================== TransfersTab ==============================
@@ -567,21 +977,25 @@ void ProjectsTab::resized()
 TransfersTab::TransfersTab (OnorabAudioProcessorEditor& editorIn)
     : owner (editorIn)
 {
-    styleLabel (noteLabel, juce::Colours::lightgrey);
-    noteLabel.setText ("Transfers refresh every 2 seconds from the Hub (Phase 1 polling; "
-                       "no WebSocket yet).",
+    styleLabel (noteLabel, kTextDim, 12.0f);
+    noteLabel.setText ("Transfers you start here appear in this list with their real progress.",
                        juce::NotificationType::dontSendNotification);
     addAndMakeVisible (noteLabel);
-    transferList.setRowHeight (22);
+    styleLabel (emptyLabel, kTextDim, 14.0f);
+    emptyLabel.setJustificationType (juce::Justification::centred);
+    emptyLabel.setText ("No transfers yet", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (emptyLabel);
+    transferList.setRowHeight (44);
     addAndMakeVisible (transferList);
-    (void) owner;
 }
 
-void TransfersTab::setTransfers (const std::vector<TransferInfo>& newTransfers)
+void TransfersTab::setRows (const std::vector<TransferRow>& newRows)
 {
-    transfers = newTransfers;
+    rows = newRows;
     transferList.updateContent();
     transferList.repaint();
+    emptyLabel.setVisible (rows.empty());
+    transferList.setVisible (! rows.empty());
 }
 
 void TransfersTab::setNote (const juce::String& text)
@@ -591,39 +1005,37 @@ void TransfersTab::setNote (const juce::String& text)
 
 void TransfersTab::resized()
 {
-    auto area = getLocalBounds().reduced (8);
+    auto area = getLocalBounds().reduced (12);
     noteLabel.setBounds (area.removeFromTop (20));
     area.removeFromTop (6);
     transferList.setBounds (area);
+    emptyLabel.setBounds (area);
 }
 
 int TransfersTab::getNumRows()
 {
-    return static_cast<int> (transfers.size());
+    return static_cast<int> (rows.size());
 }
 
-void TransfersTab::paintListBoxItem (int rowNumber, juce::Graphics& g, int width, int height,
-                                     bool rowIsSelected)
+void TransfersTab::paintListBoxItem (int, juce::Graphics&, int, int, bool)
 {
-    if (rowNumber < 0 || rowNumber >= static_cast<int> (transfers.size()))
-        return;
-    const auto& t = transfers[static_cast<size_t> (rowNumber)];
-    if (rowIsSelected)
-        g.fillAll (kCyan.withAlpha (0.2f));
-    g.setColour (juce::Colours::white);
-    g.setFont (13.0f);
-    const juce::String left = (t.fileName.isNotEmpty() ? t.fileName : t.id)
-                            + " — " + t.direction + " — " + t.status;
-    g.drawText (left, 6, 0, width - 80, height, juce::Justification::left, true);
-    g.setColour (kGreen);
-    g.drawText (juce::String (static_cast<int> (t.progress * 100.0)) + "%",
-                width - 70, 0, 64, height, juce::Justification::right, true);
-    if (t.message.isNotEmpty())
-    {
-        g.setColour (kRed);
-        g.setFont (11.0f);
-        g.drawText (t.message, 6, height - 12, width - 12, 12, juce::Justification::left, true);
-    }
+    // Rows are custom components (see refreshComponentForRow).
+}
+
+juce::Component* TransfersTab::refreshComponentForRow (int rowNumber, bool,
+                                                       juce::Component* existingComponentToUpdate)
+{
+    auto* row = dynamic_cast<TransferRowComponent*> (existingComponentToUpdate);
+    if (row == nullptr)
+        row = new TransferRowComponent();
+    if (rowNumber < 0 || rowNumber >= static_cast<int> (rows.size()))
+        return row;
+    const TransferRow data = rows[static_cast<size_t> (rowNumber)];
+    std::function<void()> retry;
+    if (data.canRetry)
+        retry = [this, data] { owner.retryTransfer (data.entry); };
+    row->update (data, std::move (retry));
+    return row;
 }
 
 // ============================== SettingsTab ==============================
@@ -631,16 +1043,42 @@ void TransfersTab::paintListBoxItem (int rowNumber, juce::Graphics& g, int width
 SettingsTab::SettingsTab (OnorabAudioProcessorEditor& editorIn)
     : owner (editorIn)
 {
-    styleLabel (hubUrlLabel);
+    styleLabel (driveTitleLabel, kText, 15.0f);
+    driveTitleLabel.setText ("Google Drive", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (driveTitleLabel);
+    driveDot.setDotColour (kGrey);
+    addAndMakeVisible (driveDot);
+    styleLabel (driveStatusLabel, kTextDim, 13.0f);
+    driveStatusLabel.setText ("Not connected", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (driveStatusLabel);
+    styleTextBox (driveEmailBox, "Gmail, e.g. you@gmail.com");
+    addAndMakeVisible (driveEmailBox);
+    stylePrimaryButton (connectDriveButton);
+    connectDriveButton.onClick = [this] { owner.connectDrive (driveEmailBox.getText().trim()); };
+    addAndMakeVisible (connectDriveButton);
+    styleLabel (driveMessageLabel, kTextDim, 12.0f);
+    addAndMakeVisible (driveMessageLabel);
+
+    styleButton (advancedButton, kPurple);
+    advancedButton.onClick = [this]
+    {
+        advancedVisible = ! advancedVisible;
+        advancedButton.setButtonText (advancedVisible ? "Advanced ^" : "Advanced v");
+        updateAdvancedVisibility();
+        resized();
+    };
+    addAndMakeVisible (advancedButton);
+
+    styleLabel (hubUrlLabel, kText, 13.0f);
     hubUrlLabel.setText ("Hub URL", juce::NotificationType::dontSendNotification);
     addAndMakeVisible (hubUrlLabel);
+    styleTextBox (hubUrlBox, "http://127.0.0.1:18741");
     addAndMakeVisible (hubUrlBox);
-
-    styleLabel (cacheDirLabel);
+    styleLabel (cacheDirLabel, kText, 13.0f);
     cacheDirLabel.setText ("Cache folder", juce::NotificationType::dontSendNotification);
     addAndMakeVisible (cacheDirLabel);
+    styleTextBox (cacheDirBox, "");
     addAndMakeVisible (cacheDirBox);
-
     styleButton (saveButton, kGreen);
     saveButton.onClick = [this]
     {
@@ -648,7 +1086,6 @@ SettingsTab::SettingsTab (OnorabAudioProcessorEditor& editorIn)
                              juce::File (cacheDirBox.getText().trim()));
     };
     addAndMakeVisible (saveButton);
-
     styleButton (browseButton);
     browseButton.onClick = [this]
     {
@@ -663,57 +1100,31 @@ SettingsTab::SettingsTab (OnorabAudioProcessorEditor& editorIn)
                                  });
     };
     addAndMakeVisible (browseButton);
+    styleLabel (savedLabel, kGreen, 12.0f);
+    addAndMakeVisible (savedLabel);
 
+    styleLabel (noteLabel, kTextDim, 12.0f);
+    noteLabel.setJustificationType (juce::Justification::topLeft);
     noteLabel.setText ("Notes: the Hub runs on localhost only. Google Drive OAuth lives in "
                        "the Hub, not in this plugin, and no tokens are ever saved in an "
                        "FL Studio project. Default cache on Windows: "
                        "%LOCALAPPDATA%\\Onorab\\cache (override with ONORAB_CACHE_DIR). "
                        "Mock Drive mode is a Hub-side setting.",
                        juce::NotificationType::dontSendNotification);
-    noteLabel.setColour (juce::Label::textColourId, juce::Colours::lightgrey);
-    noteLabel.setFont (juce::Font (juce::FontOptions (12.0f)));
-    noteLabel.setJustificationType (juce::Justification::topLeft);
     addAndMakeVisible (noteLabel);
 
-    styleLabel (statusLabel, kGreen);
-    addAndMakeVisible (statusLabel);
+    updateAdvancedVisibility();
+}
 
-    // Google Drive connect. The Hub holds the OAuth flow, not this
-    // plugin: Connect Drive asks the Hub for a Google sign-in URL and
-    // opens it in the browser. In Mock mode the Hub reports
-    // oauth_unavailable honestly instead of faking a login; in Drive
-    // mode it starts the real PKCE flow (drive.file only, token in
-    // Windows Credential Manager on this PC only).
-    styleLabel (driveLabel);
-    driveLabel.setText ("Google Drive", juce::NotificationType::dontSendNotification);
-    addAndMakeVisible (driveLabel);
-    driveEmailBox.setTextToShowWhenEmpty ("Gmail, e.g. you@gmail.com", juce::Colours::grey);
-    addAndMakeVisible (driveEmailBox);
-    styleButton (connectDriveButton, kCyan);
-    connectDriveButton.onClick = [this] { owner.connectDrive (driveEmailBox.getText().trim()); };
-    addAndMakeVisible (connectDriveButton);
-    styleLabel (driveStatusLabel, juce::Colours::lightgrey, 12.0f);
-    addAndMakeVisible (driveStatusLabel);
-
-    // Invite another user to a project. In Mock mode this records a
-    // pending invite on the Hub only. In Drive mode the Hub creates a
-    // real Drive writer permission on Onorab_projet/<project>/ for
-    // that Gmail. drive.file limitation, stated honestly in the
-    // status text: the invitee's own Hub lists the shared project
-    // once Drive shows it in their shared view.
-    styleLabel (inviteLabel);
-    inviteLabel.setText ("Invite to a project", juce::NotificationType::dontSendNotification);
-    addAndMakeVisible (inviteLabel);
-    inviteEmailBox.setTextToShowWhenEmpty ("Invited Gmail, e.g. friend@gmail.com", juce::Colours::grey);
-    addAndMakeVisible (inviteEmailBox);
-    inviteProjectBox.setTextToShowWhenEmpty ("Project name, e.g. marcus music", juce::Colours::grey);
-    addAndMakeVisible (inviteProjectBox);
-    styleButton (inviteButton, kViolet);
-    inviteButton.onClick = [this] { owner.inviteToProject (inviteEmailBox.getText().trim(),
-                                                           inviteProjectBox.getText().trim()); };
-    addAndMakeVisible (inviteButton);
-    styleLabel (inviteStatusLabel, juce::Colours::lightgrey, 12.0f);
-    addAndMakeVisible (inviteStatusLabel);
+void SettingsTab::updateAdvancedVisibility()
+{
+    hubUrlLabel.setVisible (advancedVisible);
+    hubUrlBox.setVisible (advancedVisible);
+    cacheDirLabel.setVisible (advancedVisible);
+    cacheDirBox.setVisible (advancedVisible);
+    saveButton.setVisible (advancedVisible);
+    browseButton.setVisible (advancedVisible);
+    savedLabel.setVisible (advancedVisible);
 }
 
 void SettingsTab::setValues (const juce::String& hubUrl, const juce::String& cacheDir)
@@ -724,54 +1135,138 @@ void SettingsTab::setValues (const juce::String& hubUrl, const juce::String& cac
 
 void SettingsTab::setStatus (const juce::String& text)
 {
-    statusLabel.setText (text, juce::NotificationType::dontSendNotification);
+    savedLabel.setText (text, juce::NotificationType::dontSendNotification);
 }
 
-void SettingsTab::setDriveStatus (const juce::String& text)
+void SettingsTab::setDriveConnected (bool connected)
 {
-    driveStatusLabel.setText (text, juce::NotificationType::dontSendNotification);
+    driveDot.setDotColour (connected ? kGreen : kGrey);
+    driveStatusLabel.setText (connected ? "Drive connected" : "Not connected",
+                              juce::NotificationType::dontSendNotification);
+    driveStatusLabel.setColour (juce::Label::textColourId, connected ? kGreen : kTextDim);
 }
 
-void SettingsTab::setInviteStatus (const juce::String& text)
+void SettingsTab::setDriveMessage (const juce::String& text)
 {
-    inviteStatusLabel.setText (text, juce::NotificationType::dontSendNotification);
+    driveMessageLabel.setText (text, juce::NotificationType::dontSendNotification);
 }
 
 void SettingsTab::resized()
 {
-    auto area = getLocalBounds().reduced (8);
-    hubUrlLabel.setBounds (area.removeFromTop (20));
-    hubUrlBox.setBounds (area.removeFromTop (26));
-    area.removeFromTop (8);
-    cacheDirLabel.setBounds (area.removeFromTop (20));
-    cacheDirBox.setBounds (area.removeFromTop (26));
-    area.removeFromTop (8);
-    auto row = area.removeFromTop (28);
-    saveButton.setBounds (row.removeFromLeft (90));
-    row.removeFromLeft (6);
-    browseButton.setBounds (row.removeFromLeft (110));
-    area.removeFromTop (8);
-    statusLabel.setBounds (area.removeFromTop (20));
-    area.removeFromTop (8);
-    driveLabel.setBounds (area.removeFromTop (20));
-    driveEmailBox.setBounds (area.removeFromTop (26));
+    auto area = getLocalBounds().reduced (12);
+    driveTitleLabel.setBounds (area.removeFromTop (22));
     area.removeFromTop (4);
-    auto driveRow = area.removeFromTop (28);
-    connectDriveButton.setBounds (driveRow.removeFromLeft (140));
-    driveRow.removeFromLeft (8);
-    driveStatusLabel.setBounds (driveRow);
-    area.removeFromTop (8);
-    inviteLabel.setBounds (area.removeFromTop (20));
-    inviteEmailBox.setBounds (area.removeFromTop (26));
+    auto statusRow = area.removeFromTop (22);
+    driveDot.setBounds (statusRow.removeFromLeft (22));
+    driveStatusLabel.setBounds (statusRow);
+    area.removeFromTop (6);
+    driveEmailBox.setBounds (area.removeFromTop (28));
+    area.removeFromTop (6);
+    auto connectRow = area.removeFromTop (30);
+    connectDriveButton.setBounds (connectRow.removeFromLeft (200));
     area.removeFromTop (4);
-    inviteProjectBox.setBounds (area.removeFromTop (26));
-    area.removeFromTop (4);
-    auto inviteRow = area.removeFromTop (28);
-    inviteButton.setBounds (inviteRow.removeFromLeft (90));
-    inviteRow.removeFromLeft (8);
-    inviteStatusLabel.setBounds (inviteRow);
-    area.removeFromTop (8);
+    driveMessageLabel.setBounds (area.removeFromTop (18));
+    area.removeFromTop (10);
+    advancedButton.setBounds (area.removeFromTop (30));
+    area.removeFromTop (6);
+    if (advancedVisible)
+    {
+        hubUrlLabel.setBounds (area.removeFromTop (20));
+        hubUrlBox.setBounds (area.removeFromTop (28));
+        area.removeFromTop (6);
+        cacheDirLabel.setBounds (area.removeFromTop (20));
+        cacheDirBox.setBounds (area.removeFromTop (28));
+        area.removeFromTop (6);
+        auto saveRow = area.removeFromTop (30);
+        saveButton.setBounds (saveRow.removeFromLeft (90));
+        saveRow.removeFromLeft (6);
+        browseButton.setBounds (saveRow.removeFromLeft (110));
+        area.removeFromTop (4);
+        savedLabel.setBounds (area.removeFromTop (18));
+        area.removeFromTop (6);
+    }
     noteLabel.setBounds (area);
+}
+
+// ============================== CaptureReviewPanel ==============================
+
+CaptureReviewPanel::CaptureReviewPanel (juce::AudioFormatManager& formatManagerToUse,
+                                        std::function<void (const juce::String&)> onSend,
+                                        std::function<void()> onClose,
+                                        std::function<void()> onDiscard)
+    : sendCallback (std::move (onSend)),
+      closeCallback (std::move (onClose)),
+      discardCallback (std::move (onDiscard)),
+      waveform (formatManagerToUse)
+{
+    styleLabel (titleLabel, kText, 15.0f);
+    titleLabel.setText ("Capture ready", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (titleLabel);
+    addAndMakeVisible (waveform);
+    styleTextBox (nameBox, "Capture name");
+    addAndMakeVisible (nameBox);
+    stylePrimaryButton (sendButton);
+    sendButton.onClick = [this] { if (sendCallback != nullptr) sendCallback (nameBox.getText().trim()); };
+    addAndMakeVisible (sendButton);
+    styleButton (closeButton);
+    closeButton.onClick = [this] { if (closeCallback != nullptr) closeCallback(); };
+    addAndMakeVisible (closeButton);
+    styleButton (discardButton, kRed);
+    discardButton.onClick = [this] { if (discardCallback != nullptr) discardCallback(); };
+    addAndMakeVisible (discardButton);
+    styleLabel (statusLabel, kTextDim, 12.0f);
+    addAndMakeVisible (statusLabel);
+}
+
+void CaptureReviewPanel::showFor (const juce::File& captureFile)
+{
+    waveform.setFile (captureFile);
+    nameBox.setText (captureFile.getFileNameWithoutExtension());
+    statusLabel.setText ("Review the capture, rename it if you like, then send it to Drive.",
+                         juce::NotificationType::dontSendNotification);
+    statusLabel.setColour (juce::Label::textColourId, kTextDim);
+    sendButton.setEnabled (true);
+    sendButton.setButtonText ("Send to Drive");
+    setVisible (true);
+}
+
+void CaptureReviewPanel::setStatus (const juce::String& text, bool isError)
+{
+    statusLabel.setText (text, juce::NotificationType::dontSendNotification);
+    statusLabel.setColour (juce::Label::textColourId, isError ? kRed : kTextDim);
+}
+
+void CaptureReviewPanel::setUploaded()
+{
+    statusLabel.setText ("Uploaded", juce::NotificationType::dontSendNotification);
+    statusLabel.setColour (juce::Label::textColourId, kGreen);
+    sendButton.setEnabled (false);
+    sendButton.setButtonText ("Uploaded");
+}
+
+void CaptureReviewPanel::setSending (bool sending)
+{
+    sendButton.setEnabled (! sending);
+    sendButton.setButtonText (sending ? "Sending..." : "Send to Drive");
+}
+
+void CaptureReviewPanel::resized()
+{
+    auto area = getLocalBounds().reduced (14);
+    titleLabel.setBounds (area.removeFromTop (22));
+    area.removeFromTop (4);
+    waveform.setBounds (area.removeFromTop (110));
+    area.removeFromTop (6);
+    nameBox.setBounds (area.removeFromTop (28));
+    area.removeFromTop (6);
+    auto buttonRow = area.removeFromTop (30);
+    sendButton.setBounds (buttonRow.removeFromLeft (150));
+    buttonRow.removeFromLeft (6);
+    closeButton.setBounds (buttonRow.removeFromLeft (90));
+    buttonRow.removeFromLeft (6);
+    discardButton.setBounds (buttonRow.removeFromLeft (90));
+    area.removeFromTop (6);
+    statusLabel.setBounds (area);
 }
 
 // ============================== Editor ==============================
@@ -781,34 +1276,68 @@ OnorabAudioProcessorEditor::OnorabAudioProcessorEditor (OnorabAudioProcessor& pr
       audioProcessor (processorIn),
       hub (processorIn.getHubUrl())
 {
-    setSize (760, 520);
+    setSize (920, 600);
 
     formatManager.registerBasicFormats();
     readAheadThread.startThread();
     hub.setAliveToken (aliveToken);
+
+    // Persistent header: title, Hub / Drive status, Capture button.
+    styleLabel (titleLabel, kText, 20.0f);
+    titleLabel.setText ("Onorab", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (titleLabel);
+    styleLabel (byLabel, kTextDim, 12.0f);
+    byLabel.setText ("by Potorik Track", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (byLabel);
+    hubDot.setDotColour (kGrey);
+    addAndMakeVisible (hubDot);
+    styleLabel (hubStatusLabel, kTextDim, 12.0f);
+    hubStatusLabel.setText ("Hub: checking...", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (hubStatusLabel);
+    driveDot.setDotColour (kGrey);
+    addAndMakeVisible (driveDot);
+    styleLabel (driveStatusLabel, kTextDim, 12.0f);
+    driveStatusLabel.setText ("Drive: checking...", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (driveStatusLabel);
+    styleLabel (captureCounterLabel, kText, 13.0f);
+    addAndMakeVisible (captureCounterLabel);
+    stylePrimaryButton (captureButton);
+    captureButton.onClick = [this]
+    {
+        if (audioProcessor.isCapturing())
+            stopCapture();
+        else
+            startCapture();
+    };
+    addAndMakeVisible (captureButton);
 
     libraryTab = new LibraryTab (*this);
     projectsTab = new ProjectsTab (*this);
     transfersTab = new TransfersTab (*this);
     settingsTab = new SettingsTab (*this);
 
-    tabbedComponent.addTab ("Cloud Library", kGraphite, libraryTab, true);
-    tabbedComponent.addTab ("Projects", kGraphite, projectsTab, true);
-    tabbedComponent.addTab ("Transfers", kGraphite, transfersTab, true);
-    tabbedComponent.addTab ("Settings", kGraphite, settingsTab, true);
+    tabbedComponent.addTab ("Library", kPanel, libraryTab, true);
+    tabbedComponent.addTab ("Projects", kPanel, projectsTab, true);
+    tabbedComponent.addTab ("Transfers", kPanel, transfersTab, true);
+    tabbedComponent.addTab ("Settings", kPanel, settingsTab, true);
+    addAndMakeVisible (tabbedComponent);
+
+    captureReview = new CaptureReviewPanel (formatManager,
+        [this] (const juce::String& name) { sendCaptureToDrive (name); },
+        [this] { closeCaptureReview(); },
+        [this] { discardCapture(); });
+    addAndMakeVisible (captureReview);
+    captureReview->setVisible (false);
 
     settingsTab->setValues (audioProcessor.getHubUrl(),
                             audioProcessor.getCacheDir().getFullPathName());
 
-    // The editor itself IS the DragAndDropContainer (see header), so the
-    // tabbed component is added directly to the editor.
-    addAndMakeVisible (tabbedComponent);
-
     refreshFiles();
     checkHealth();
     refreshTransfers (true);
+    refreshDriveStatus();
     refreshProjectsTab();
-    startTimer (2000); // Phase 1 polling for transfers + Hub health.
+    startTimer (1000);
 }
 
 OnorabAudioProcessorEditor::~OnorabAudioProcessorEditor()
@@ -828,12 +1357,39 @@ OnorabAudioProcessorEditor::~OnorabAudioProcessorEditor()
 
 void OnorabAudioProcessorEditor::paint (juce::Graphics& g)
 {
-    g.fillAll (kGraphite);
+    g.fillAll (kBackground);
+    g.setColour (kPanel);
+    g.fillRect (0, 0, getWidth(), 56);
+    g.setColour (kPanel2);
+    g.fillRect (0, 56, getWidth(), 1);
 }
 
 void OnorabAudioProcessorEditor::resized()
 {
-    tabbedComponent.setBounds (getLocalBounds());
+    auto header = getLocalBounds().removeFromTop (56);
+    header.removeFromLeft (12);
+    titleLabel.setBounds (header.removeFromLeft (100));
+    byLabel.setBounds (header.removeFromLeft (110));
+    header.removeFromLeft (8);
+    auto hubArea = header.removeFromLeft (170);
+    hubDot.setBounds (hubArea.removeFromLeft (20));
+    hubStatusLabel.setBounds (hubArea);
+    header.removeFromLeft (4);
+    auto driveArea = header.removeFromLeft (180);
+    driveDot.setBounds (driveArea.removeFromLeft (20));
+    driveStatusLabel.setBounds (driveArea);
+    auto captureArea = header;
+    captureButton.setBounds (captureArea.removeFromRight (160));
+    captureArea.removeFromRight (8);
+    captureCounterLabel.setBounds (captureArea);
+
+    tabbedComponent.setBounds (0, 57, getWidth(), getHeight() - 57);
+    if (captureReview != nullptr && captureReview->isVisible())
+    {
+        const int w = 660, h = 320;
+        captureReview->setBounds ((getWidth() - w) / 2, 57 + (getHeight() - 57 - h) / 2, w, h);
+        captureReview->toFront (false);
+    }
 }
 
 bool OnorabAudioProcessorEditor::isInterestedInFileDrag (const juce::StringArray& files)
@@ -854,25 +1410,47 @@ void OnorabAudioProcessorEditor::filesDropped (const juce::StringArray& files, i
         if (isAudioFile (f))
         {
             anyAudio = true;
-            uploadLocalFile (juce::File (f));
+            uploadLocalFileInternal (juce::File (f), {}, -1);
         }
     }
     if (! anyAudio)
-        setError ("Dropped files were not audio files — nothing was uploaded.");
+        setError ("Dropped files were not audio files - nothing was uploaded.");
 }
 
 void OnorabAudioProcessorEditor::timerCallback()
 {
-    // Polling only (Phase 1). This is deliberately lightweight localhost
-    // traffic; a WebSocket /events client replaces it in Phase 2.
-    checkHealth();
-    refreshTransfers (true);
+    ++timerTicks;
+    // Capture counter + player position update every second.
+    if (audioProcessor.isCapturing())
+    {
+        const int elapsed = static_cast<int> ((juce::Time::getCurrentTime() - captureStartTime).inSeconds());
+        captureCounterLabel.setText (formatDuration (static_cast<double> (elapsed)),
+                                     juce::NotificationType::dontSendNotification);
+    }
+    if (previewSource != nullptr)
+    {
+        if (libraryTab != nullptr)
+            libraryTab->setPlayerPosition (transport.getCurrentPosition(), transport.getLengthInSeconds());
+        syncPlayerState();
+    }
+    // Polling only (Phase 1): health + transfers every 2 seconds,
+    // Drive auth status every 10 seconds. Lightweight localhost traffic;
+    // a WebSocket /events client replaces it in Phase 2.
+    if (timerTicks % 2 == 0)
+    {
+        checkHealth();
+        refreshTransfers (true);
+    }
+    if (timerTicks % 10 == 0)
+        refreshDriveStatus();
 }
 
 void OnorabAudioProcessorEditor::setError (const juce::String& text)
 {
     if (libraryTab != nullptr)
         libraryTab->setError (text);
+    if (projectsTab != nullptr)
+        projectsTab->setStatus (text, true);
     if (text.isNotEmpty())
         DBG ("Onorab UI error: " << text);
 }
@@ -880,12 +1458,32 @@ void OnorabAudioProcessorEditor::setError (const juce::String& text)
 void OnorabAudioProcessorEditor::setProgress (const juce::String& text)
 {
     if (libraryTab != nullptr)
-        libraryTab->setProgress (text);
+        libraryTab->setMessage (text);
+    if (projectsTab != nullptr)
+        projectsTab->setStatus (text, false);
+}
+
+void OnorabAudioProcessorEditor::refreshLocalIds()
+{
+    localIds.clear();
+    const juce::File cache = audioProcessor.getCacheDir();
+    for (const auto& f : files)
+    {
+        if (cache.getChildFile (HubClient::sanitiseFileName (f.name)).existsAsFile())
+            localIds.push_back (f.id);
+    }
+    if (hasSelection)
+    {
+        selectedLocalFile = cache.getChildFile (HubClient::sanitiseFileName (selectedFile.name));
+        selectedLocalExists = selectedLocalFile.existsAsFile();
+    }
+    if (libraryTab != nullptr)
+        libraryTab->setFiles (files, localIds);
 }
 
 void OnorabAudioProcessorEditor::refreshFiles()
 {
-    setProgress ("Refreshing Cloud Library…");
+    setProgress ("Refreshing Library...");
     hub.listFiles ([this] (bool ok, juce::String error, std::vector<CloudFile> newFiles)
     {
         if (ok)
@@ -895,17 +1493,15 @@ void OnorabAudioProcessorEditor::refreshFiles()
             // Projects filters preserve this order, so an invited
             // user's upload appears at the end, in order.
             files = std::move (newFiles);
+            refreshLocalIds();
             if (libraryTab != nullptr)
-            {
-                libraryTab->setFiles (files);
                 libraryTab->setError ("");
-            }
             setProgress ("Loaded " + juce::String (files.size()) + " file(s) from the Hub.");
             refreshProjectsTab();
         }
         else
         {
-            setError ("Could not load the Cloud Library: " + error);
+            setError ("Could not load the Library: " + error);
             setProgress ("");
         }
     });
@@ -918,218 +1514,132 @@ void OnorabAudioProcessorEditor::onFileSelected (const CloudFile& file)
     selectedLocalFile = audioProcessor.getCacheDir()
                             .getChildFile (HubClient::sanitiseFileName (file.name));
     selectedLocalExists = selectedLocalFile.existsAsFile();
-    if (libraryTab != nullptr)
-        libraryTab->setSelectedLocalFile (selectedLocalFile, selectedLocalExists);
+    selectedDurationSeconds = -1.0;
     if (selectedLocalExists)
-        loadPreview (selectedLocalFile);
-    else
-        setProgress ("Take from Drive to fetch \"" + file.name + "\" to this computer.");
-}
-
-void OnorabAudioProcessorEditor::takeSelectedFiles()
-{
-    std::vector<CloudFile> wanted;
+    {
+        std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (selectedLocalFile));
+        if (reader != nullptr && reader->sampleRate > 0)
+            selectedDurationSeconds = static_cast<double> (reader->lengthInSamples) / reader->sampleRate;
+    }
     if (libraryTab != nullptr)
-        wanted = libraryTab->getSelectedFiles();
-    if (wanted.empty() && hasSelection)
-        wanted.push_back (selectedFile);
-    if (wanted.empty())
     {
-        setError ("Select one or more files in the Cloud Library first, then Take from Drive.");
-        return;
+        libraryTab->setSelected (file, selectedLocalExists);
+        libraryTab->setPlayer (file.name, selectedLocalFile, selectedLocalExists, selectedDurationSeconds);
     }
-
-    // Shared completion state: downloads run in parallel on HubClient
-    // background threads, but every callback lands on the message
-    // thread, so this counter needs no lock.
-    struct TakeState
+    if (selectedLocalExists)
     {
-        int total = 0;
-        int done = 0;
-        juce::StringArray taken;
-        juce::StringArray failed;
-        bool previewLoaded = false;
-    };
-    auto state = std::make_shared<TakeState>();
-    state->total = static_cast<int> (wanted.size());
-    setProgress ("Taking " + juce::String (state->total) + " file(s) from Drive…");
-
-    for (const auto& file : wanted)
+        loadPreview (selectedLocalFile);
+    }
+    else
     {
-        hub.downloadFile (file, audioProcessor.getCacheDir(),
-            [this, file, state] (bool ok, juce::String error, juce::File localFile)
-            {
-                if (ok)
-                {
-                    state->taken.add (localFile.getFullPathName());
-                    if (! state->previewLoaded)
-                    {
-                        state->previewLoaded = true;
-                        selectedLocalFile = localFile;
-                        selectedLocalExists = true;
-                        if (libraryTab != nullptr)
-                            libraryTab->setSelectedLocalFile (localFile, true);
-                        loadPreview (localFile);
-                    }
-                }
-                else
-                {
-                    state->failed.add (file.name + ": " + error);
-                }
-                if (++state->done >= state->total)
-                {
-                    if (libraryTab != nullptr)
-                        libraryTab->setTakenLocalFiles (state->taken);
-                    if (state->failed.isEmpty())
-                    {
-                        setProgress ("Took " + juce::String (state->taken.size())
-                                      + " file(s) — drag the violet box into FL Studio.");
-                        setError ("");
-                    }
-                    else
-                    {
-                        setError ("Some sounds could not be taken: " + state->failed.joinIntoString (", "));
-                        setProgress ("Took " + juce::String (state->taken.size())
-                                     + " of " + juce::String (state->total) + " file(s).");
-                    }
-                    refreshProjectsTab();
-                }
-            });
+        transport.stop();
+        previewSource.reset();
+        transport.setSource (nullptr);
+        playingFileId.clear();
+        syncPlayerState();
+        setProgress ("Press Download on \"" + file.name + "\" to fetch it to this computer.");
     }
 }
 
-void OnorabAudioProcessorEditor::uploadLocalFile (const juce::File& file)
+void OnorabAudioProcessorEditor::clearSelection()
 {
-    uploadLocalFile (file, {});
+    hasSelection = false;
+    selectedLocalExists = false;
+    playingFileId.clear();
+    transport.stop();
+    previewSource.reset();
+    transport.setSource (nullptr);
+    if (libraryTab != nullptr)
+        libraryTab->clearSelection();
 }
 
-void OnorabAudioProcessorEditor::uploadLocalFile (const juce::File& file, const juce::String& project)
+void OnorabAudioProcessorEditor::downloadFile (const CloudFile& file)
 {
-    if (! file.existsAsFile())
+    downloadFileInternal (file, -1);
+}
+
+void OnorabAudioProcessorEditor::downloadFileInternal (const CloudFile& file, int reuseEntry)
+{
+    int entry = reuseEntry;
+    if (entry < 0 || entry >= static_cast<int> (localTransfers.size()))
     {
-        setError ("Upload failed: file does not exist: " + file.getFullPathName());
-        return;
+        entry = addLocalTransfer (file.name, "Download");
+        localTransfers[static_cast<size_t> (entry)].retry = [this, file] (int idx)
+        {
+            downloadFileInternal (file, idx);
+        };
     }
-    const juce::String folder = project.isNotEmpty() ? (" to " + HubClient::projectFolder (project)) : juce::String {};
-    setProgress ("Uploading \"" + file.getFileName() + "\"" + folder + "…");
-    hub.uploadFile (file,
-        [this, file, folder] (bool ok, juce::String error)
+    else
+    {
+        updateLocalTransfer (entry, 0.0, "Downloading...", "", false);
+    }
+    setProgress ("Downloading \"" + file.name + "\"...");
+    hub.downloadFile (file, audioProcessor.getCacheDir(),
+        [this, file, entry] (bool ok, juce::String error, juce::File localFile)
         {
             if (ok)
             {
-                setProgress ("Uploaded: " + file.getFileName() + folder);
-                setError ("");
-                refreshFiles();
-                refreshTransfers (false);
+                updateLocalTransfer (entry, 1.0, "Done", "", false);
+                if (libraryTab != nullptr)
+                    libraryTab->setDownloadProgress (file.id, 0.0, false);
+                refreshLocalIds();
+                if (hasSelection && selectedFile.id == file.id)
+                {
+                    selectedLocalFile = localFile;
+                    selectedLocalExists = true;
+                    onFileSelected (file);
+                }
+                setProgress ("Downloaded: " + file.name + " - Ready for FL");
+                if (playAfterDownloadId == file.id)
+                {
+                    playAfterDownloadId.clear();
+                    playRowFile (file);
+                }
             }
             else
             {
-                setError ("Upload failed: " + error);
-                setProgress ("");
+                updateLocalTransfer (entry, localTransfers[static_cast<size_t> (entry)].progress,
+                                     "Failed", error, true);
+                if (libraryTab != nullptr)
+                    libraryTab->setDownloadProgress (file.id, 0.0, false);
+                setError ("Download failed: " + error);
             }
+            refreshTransfers (false);
         },
-        nullptr, project);
-}
-
-void OnorabAudioProcessorEditor::uploadFilesToProject (const std::vector<juce::File>& files,
-                                                       const juce::String& project)
-{
-    if (project.isEmpty())
-    {
-        setError ("Enter a project name first (e.g. marcus music) — uploads go to Onorab_projet/<project>/.");
-        return;
-    }
-    if (files.empty())
-    {
-        setError ("No file chosen — pick one or more audio files to upload to this project.");
-        return;
-    }
-    // Each uploadLocalFile reports its own completion and refreshes the
-    // list; no synchronous "done" message here, because the uploads
-    // themselves are asynchronous — a counter decremented here would
-    // fire before any upload actually finished.
-    setProgress ("Uploading " + juce::String (files.size()) + " file(s) to "
-                 + HubClient::projectFolder (project) + "…");
-    for (const auto& f : files)
-        uploadLocalFile (f, project);
-}
-
-void OnorabAudioProcessorEditor::pushProjectFiles (const std::vector<CloudFile>& files,
-                                                   const juce::String& project)
-{
-    if (files.empty())
-    {
-        setError ("Select a song in this project first, then Push.");
-        return;
-    }
-    // Target folder: the typed project name wins; otherwise the first
-    // selected sound's own project (re-pushing it into its own folder
-    // is a no-op target, so an empty target is still an error).
-    juce::String target = project;
-    if (target.isEmpty())
-        target = files.front().projectId;
-    if (target.isEmpty())
-    {
-        setError ("Enter a project name first (e.g. marcus music) — Push goes to Onorab_projet/<project>/.");
-        return;
-    }
-
-    struct PushState
-    {
-        int total = 0;
-        int done = 0;
-        int pushed = 0;
-        juce::StringArray skipped;
-    };
-    auto state = std::make_shared<PushState>();
-    std::vector<juce::File> toPush;
-    for (const auto& f : files)
-    {
-        const juce::File local = audioProcessor.getCacheDir()
-                                     .getChildFile (HubClient::sanitiseFileName (f.name));
-        if (local.existsAsFile())
-            toPush.push_back (local);
-        else
-            state->skipped.add (f.name);
-    }
-    if (toPush.empty())
-    {
-        setError ("Nothing to Push — none of the selected sounds is local yet. "
-                  "Take them from the Cloud Library first, then Push.");
-        return;
-    }
-    state->total = static_cast<int> (toPush.size());
-    setProgress ("Pushing " + juce::String (state->total) + " file(s) to "
-                 + HubClient::projectFolder (target) + "…");
-    for (const auto& local : toPush)
-    {
-        hub.uploadFile (local,
-            [this, target, state] (bool ok, juce::String error)
+        [this, file, entry] (double progress)
+        {
+            juce::MessageManager::callAsync ([this, file, entry, progress]
             {
-                if (ok)
-                    ++state->pushed;
-                else
-                    state->skipped.add (error);
-                if (++state->done >= state->total)
-                {
-                    if (state->skipped.isEmpty())
-                    {
-                        setProgress ("Pushed " + juce::String (state->pushed)
-                                      + " file(s) to " + HubClient::projectFolder (target) + ".");
-                        setError ("");
-                    }
-                    else
-                    {
-                        setError ("Push skipped: " + state->skipped.joinIntoString (", "));
-                        setProgress ("Pushed " + juce::String (state->pushed)
-                                     + " of " + juce::String (state->total) + " file(s).");
-                    }
-                    refreshFiles();
-                    refreshTransfers (false);
-                }
-            },
-            nullptr, target);
+                if (libraryTab != nullptr)
+                    libraryTab->setDownloadProgress (file.id, progress, true);
+                updateLocalTransfer (entry, progress >= 0 ? progress : 0.0,
+                                     "Downloading...", "", false);
+            });
+        });
+}
+
+void OnorabAudioProcessorEditor::playRowFile (const CloudFile& file)
+{
+    if (! hasSelection || selectedFile.id != file.id)
+        onFileSelected (file);
+    if (selectedLocalExists)
+    {
+        if (transport.isPlaying() && playingFileId == file.id)
+        {
+            pausePreview();
+            return;
+        }
+        if (previewSource == nullptr || playingFileId != file.id)
+            loadPreview (selectedLocalFile);
+        transport.start();
+        playingFileId = file.id;
+        syncPlayerState();
+        setError ("");
+        return;
     }
+    // Not local yet: download first, then play automatically.
+    playAfterDownloadId = file.id;
+    downloadFileInternal (file, -1);
 }
 
 void OnorabAudioProcessorEditor::deleteHubFiles (const std::vector<CloudFile>& filesIn)
@@ -1153,7 +1663,7 @@ void OnorabAudioProcessorEditor::deleteHubFiles (const std::vector<CloudFile>& f
     };
     auto state = std::make_shared<DeleteState>();
     state->total = static_cast<int> (wanted.size());
-    setProgress ("Deleting " + juce::String (state->total) + " file(s)…");
+    setProgress ("Deleting " + juce::String (state->total) + " file(s)...");
     for (const auto& file : wanted)
     {
         hub.deleteFile (file, [this, file, state] (bool ok, juce::String error)
@@ -1190,16 +1700,158 @@ void OnorabAudioProcessorEditor::deleteHubFiles (const std::vector<CloudFile>& f
                 // If the selected sound was deleted, clear the preview
                 // instead of pointing at a file that no longer exists.
                 if (state->deletedIds.contains (selectedFile.id))
-                {
-                    hasSelection = false;
-                    selectedLocalExists = false;
-                    if (libraryTab != nullptr)
-                        libraryTab->setSelectedLocalFile (juce::File {}, false);
-                }
+                    clearSelection();
                 refreshFiles();
             }
         });
     }
+}
+
+void OnorabAudioProcessorEditor::uploadLocalFile (const juce::File& file)
+{
+    uploadLocalFileInternal (file, {}, -1);
+}
+
+void OnorabAudioProcessorEditor::uploadLocalFile (const juce::File& file, const juce::String& project)
+{
+    uploadLocalFileInternal (file, project, -1);
+}
+
+void OnorabAudioProcessorEditor::uploadLocalFileInternal (const juce::File& file,
+                                                          const juce::String& project, int reuseEntry)
+{
+    if (! file.existsAsFile())
+    {
+        setError ("Upload failed: file does not exist: " + file.getFullPathName());
+        return;
+    }
+    int entry = reuseEntry;
+    if (entry < 0 || entry >= static_cast<int> (localTransfers.size()))
+    {
+        entry = addLocalTransfer (file.getFileName(), "Upload");
+        localTransfers[static_cast<size_t> (entry)].retry = [this, file, project] (int idx)
+        {
+            uploadLocalFileInternal (file, project, idx);
+        };
+    }
+    else
+    {
+        updateLocalTransfer (entry, 0.0, "Uploading...", "", false);
+    }
+    const juce::String folder = project.isNotEmpty() ? (" to " + HubClient::projectFolder (project)) : juce::String {};
+    setProgress ("Uploading \"" + file.getFileName() + "\"" + folder + "...");
+    hub.uploadFile (file,
+        [this, file, folder, entry] (bool ok, juce::String error)
+        {
+            if (ok)
+            {
+                updateLocalTransfer (entry, 1.0, "Done", "", false);
+                setProgress ("Uploaded: " + file.getFileName() + folder);
+                setError ("");
+                refreshFiles();
+            }
+            else
+            {
+                updateLocalTransfer (entry, localTransfers[static_cast<size_t> (entry)].progress,
+                                     "Failed", error, true);
+                setError ("Upload failed: " + error);
+                setProgress ("");
+            }
+            // The capture review hook fires only for the capture's own
+            // upload, never for an unrelated upload that finished first.
+            if (captureUploadHook != nullptr && file == captureUploadTarget)
+            {
+                auto hook = captureUploadHook;
+                captureUploadHook = nullptr;
+                hook (ok, error);
+            }
+            refreshTransfers (false);
+        },
+        [this, entry] (double progress)
+        {
+            juce::MessageManager::callAsync ([this, entry, progress]
+            {
+                // Hub upload progress is coarse (sent / done); the bar
+                // reflects the real callback values, never a fake curve.
+                updateLocalTransfer (entry, progress >= 0 ? progress : 0.0,
+                                     "Uploading...", "", false);
+            });
+        },
+        project);
+}
+
+void OnorabAudioProcessorEditor::uploadFilesToProject (const std::vector<juce::File>& files,
+                                                       const juce::String& project)
+{
+    if (project.isEmpty())
+    {
+        setError ("Open a project first - uploads go to Onorab_projet/<project>/.");
+        return;
+    }
+    if (files.empty())
+    {
+        setError ("No file chosen - pick one or more audio files to upload to this project.");
+        return;
+    }
+    setProgress ("Uploading " + juce::String (files.size()) + " file(s) to "
+                 + HubClient::projectFolder (project) + "...");
+    for (const auto& f : files)
+        uploadLocalFileInternal (f, project, -1);
+}
+
+void OnorabAudioProcessorEditor::pushProjectFiles (const std::vector<CloudFile>& files,
+                                                   const juce::String& project)
+{
+    if (files.empty())
+    {
+        setError ("Select a song in this project first, then Push.");
+        return;
+    }
+    // Target folder: the open project wins; otherwise the first
+    // selected sound's own project (re-pushing it into its own folder
+    // is a no-op target, so an empty target is still an error).
+    juce::String target = project;
+    if (target.isEmpty())
+        target = files.front().projectId;
+    if (target.isEmpty())
+    {
+        setError ("Open a project first - Push goes to Onorab_projet/<project>/.");
+        return;
+    }
+
+    std::vector<juce::File> toPush;
+    juce::StringArray skipped;
+    for (const auto& f : files)
+    {
+        const juce::File local = audioProcessor.getCacheDir()
+                                     .getChildFile (HubClient::sanitiseFileName (f.name));
+        if (local.existsAsFile())
+            toPush.push_back (local);
+        else
+            skipped.add (f.name);
+    }
+    if (toPush.empty())
+    {
+        setError ("Nothing to Push - none of the selected sounds is local yet. "
+                  "Download them from the Library first, then Push.");
+        return;
+    }
+    juce::String note = "Pushing " + juce::String (toPush.size()) + " file(s) to "
+                      + HubClient::projectFolder (target) + "...";
+    if (! skipped.isEmpty())
+        note += " (" + juce::String (skipped.size()) + " skipped - not local yet.)";
+    setProgress (note);
+    for (const auto& local : toPush)
+        uploadLocalFileInternal (local, target, -1);
+}
+
+void OnorabAudioProcessorEditor::retryTransfer (int entry)
+{
+    if (entry < 0 || entry >= static_cast<int> (localTransfers.size()))
+        return;
+    const auto retry = localTransfers[static_cast<size_t> (entry)].retry;
+    if (retry != nullptr)
+        retry (entry);
 }
 
 void OnorabAudioProcessorEditor::connectDrive (const juce::String& email)
@@ -1208,27 +1860,28 @@ void OnorabAudioProcessorEditor::connectDrive (const juce::String& email)
         return;
     if (email.isEmpty() || ! email.containsChar ('@'))
     {
-        settingsTab->setDriveStatus ("Enter a Gmail address first (it must contain '@').");
+        settingsTab->setDriveMessage ("Enter a Gmail address first (it must contain '@').");
         return;
     }
-    settingsTab->setDriveStatus ("Checking Hub Drive status for " + email + "…");
+    settingsTab->setDriveMessage ("Checking Hub Drive status for " + email + "...");
     hub.getAuthStatus ([this, email] (bool ok, juce::String error, juce::String detail)
     {
         if (settingsTab == nullptr)
             return;
         if (! ok)
         {
-            settingsTab->setDriveStatus ("Drive check failed: " + error);
+            settingsTab->setDriveMessage ("Drive check failed: " + error);
             return;
         }
         if (detail.contains ("authenticated: 1") || detail.contains ("authenticated: true"))
         {
-            settingsTab->setDriveStatus ("Drive connected (" + detail + ").");
+            settingsTab->setDriveMessage ("Drive connected (" + detail + ").");
+            refreshDriveStatus();
             return;
         }
         // Not connected yet: ask the Hub to start auth. The Hub returns
         // a Google sign-in URL; the plugin opens it in the user's
-        // browser (Google's own page — the plugin never sees a
+        // browser (Google's own page - the plugin never sees a
         // password). In Mock mode this returns oauth_unavailable,
         // reported honestly, not faked into a login. Commercial note:
         // every PC signs in with its OWN Gmail; the token stays on
@@ -1240,23 +1893,24 @@ void OnorabAudioProcessorEditor::connectDrive (const juce::String& email)
                 return;
             if (! authOk && authError.containsIgnoreCase ("oauth_unavailable"))
             {
-                settingsTab->setDriveStatus ("Drive is not connected yet — the Hub is in Mock mode. "
-                                             "Start the Hub with ONORAB_DRIVE_PROVIDER=drive, then press Connect Drive again.");
+                settingsTab->setDriveMessage ("Drive is not connected yet - the Hub is in Mock mode. "
+                                              "Start the Hub with ONORAB_DRIVE_PROVIDER=drive, then press Connect Drive again.");
             }
             else if (authOk && authUrl.startsWith ("https://"))
             {
                 juce::URL (authUrl).launchInDefaultBrowser();
-                settingsTab->setDriveStatus ("Browser opened — sign in with YOUR Gmail (" + email + "), "
-                                             "approve drive.file access, then press Refresh in Cloud Library. "
-                                             "Your token stays on this PC only.");
+                settingsTab->setDriveMessage ("Browser opened - sign in with YOUR Gmail (" + email + "), "
+                                              "approve drive.file access, then wait: this panel shows "
+                                              "\"Drive connected\" once the Hub confirms it. "
+                                              "Your token stays on this PC only.");
             }
             else if (authOk)
             {
-                settingsTab->setDriveStatus ("Drive sign-in started — follow the browser prompt, then press Refresh.");
+                settingsTab->setDriveMessage ("Drive sign-in started - follow the browser prompt.");
             }
             else
             {
-                settingsTab->setDriveStatus ("Drive connect failed: " + authError);
+                settingsTab->setDriveMessage ("Drive connect failed: " + authError);
             }
         });
     });
@@ -1264,43 +1918,31 @@ void OnorabAudioProcessorEditor::connectDrive (const juce::String& email)
 
 void OnorabAudioProcessorEditor::inviteToProject (const juce::String& email, const juce::String& project)
 {
-    if (settingsTab == nullptr)
+    if (projectsTab == nullptr)
         return;
     if (email.isEmpty() || ! email.containsChar ('@'))
     {
-        settingsTab->setInviteStatus ("Enter an invited Gmail address first (it must contain '@').");
+        projectsTab->setInviteStatus ("Enter an invited Gmail address first (it must contain '@').");
         return;
     }
     if (project.isEmpty())
     {
-        settingsTab->setInviteStatus ("Enter a project name to invite someone to.");
+        projectsTab->setInviteStatus ("Enter a project name to invite someone to.");
         return;
     }
-    settingsTab->setInviteStatus ("Recording invite for " + email + "…");
+    projectsTab->setInviteStatus ("Recording invite for " + email + "...");
     hub.sendInvite (email, project, [this, email, project] (bool ok, juce::String error)
     {
-        if (settingsTab == nullptr)
+        if (projectsTab == nullptr)
             return;
         if (ok)
-            settingsTab->setInviteStatus ("Invite recorded for " + email + " on project " + project
+            projectsTab->setInviteStatus ("Invite recorded for " + email + " on project " + project
                                           + ". In Drive mode this also creates a real Drive writer permission on "
                                           + HubClient::projectFolder (project)
                                           + "; in Mock mode it is a local record only.");
         else
-            settingsTab->setInviteStatus ("Invite failed: " + error);
+            projectsTab->setInviteStatus ("Invite failed: " + error);
     });
-}
-
-void OnorabAudioProcessorEditor::uploadLastCapture()
-{
-    const juce::File capture = audioProcessor.getLastCaptureFile();
-    if (! capture.existsAsFile())
-    {
-        setError ("No capture yet — press “Capture from FL”, let audio play through "
-                  "the Mixer Track, then press “Stop capture” first.");
-        return;
-    }
-    uploadLocalFile (capture);
 }
 
 void OnorabAudioProcessorEditor::loadPreview (const juce::File& file)
@@ -1321,14 +1963,25 @@ void OnorabAudioProcessorEditor::loadPreview (const juce::File& file)
     transport.setGain (previewGain);
 }
 
+void OnorabAudioProcessorEditor::syncPlayerState()
+{
+    const bool playing = transport.isPlaying();
+    if (libraryTab != nullptr)
+    {
+        libraryTab->setPlayerPlaying (playing);
+        libraryTab->setPlaying (playing ? playingFileId : juce::String {}, playing);
+    }
+}
+
 void OnorabAudioProcessorEditor::playPreview()
 {
     if (previewSource == nullptr)
     {
-        setError ("No preview loaded — take a file from the Cloud Library first.");
+        setError ("No preview loaded - press Download on a sound first.");
         return;
     }
     transport.start();
+    syncPlayerState();
     setError ("");
 }
 
@@ -1336,12 +1989,41 @@ void OnorabAudioProcessorEditor::pausePreview()
 {
     // stop() pauses without resetting the playhead; Stop resets it.
     transport.stop();
+    syncPlayerState();
 }
 
 void OnorabAudioProcessorEditor::stopPreview()
 {
     transport.stop();
     transport.setPosition (0.0);
+    playingFileId.clear();
+    syncPlayerState();
+    if (libraryTab != nullptr && previewSource != nullptr)
+        libraryTab->setPlayerPosition (0.0, transport.getLengthInSeconds());
+}
+
+void OnorabAudioProcessorEditor::togglePlayerPlay()
+{
+    if (transport.isPlaying())
+    {
+        pausePreview();
+        return;
+    }
+    if (previewSource != nullptr)
+    {
+        transport.start();
+        syncPlayerState();
+        return;
+    }
+    if (hasSelection && selectedLocalExists)
+    {
+        loadPreview (selectedLocalFile);
+        transport.start();
+        playingFileId = selectedFile.id;
+        syncPlayerState();
+        return;
+    }
+    setError ("No preview loaded - press Download on a sound first.");
 }
 
 void OnorabAudioProcessorEditor::setPreviewGain (float gain)
@@ -1350,29 +2032,19 @@ void OnorabAudioProcessorEditor::setPreviewGain (float gain)
     transport.setGain (gain);
 }
 
-void OnorabAudioProcessorEditor::toggleCapture()
+void OnorabAudioProcessorEditor::setCaptureUI (bool capturing)
+{
+    captureButton.setButtonText (capturing ? "Stop" : "Capture from FL");
+    captureCounterLabel.setText (capturing ? "0:00" : "",
+                                  juce::NotificationType::dontSendNotification);
+}
+
+void OnorabAudioProcessorEditor::startCapture()
 {
     if (audioProcessor.isCapturing())
-    {
-        // stopCapture joins the writer thread, so the finished callback
-        // (queued below) is already posted by the time this returns.
-        audioProcessor.stopCapture();
-        if (libraryTab != nullptr)
-            libraryTab->setCapturing (false);
         return;
-    }
-
     const auto now = juce::Time::getCurrentTime();
-    // Bus capture naming: a typed track name becomes the file prefix
-    // (sanitised, so it can never escape the cache dir), followed by
-    // the timestamp so two captures of the same track never overwrite
-    // each other. Empty name = the old auto name.
-    juce::String fileName;
-    if (libraryTab != nullptr && libraryTab->getCaptureName().isNotEmpty())
-        fileName = HubClient::sanitiseFileName (libraryTab->getCaptureName())
-                 + "-" + now.formatted ("%Y%m%d-%H%M%S") + ".wav";
-    if (fileName.isEmpty())
-        fileName = "capture-" + now.formatted ("%Y%m%d-%H%M%S") + ".wav";
+    const juce::String fileName = "capture-" + now.formatted ("%Y%m%d-%H%M%S") + ".wav";
 
     // SafePointer: if the editor is destroyed before the queued callback
     // runs, getComponent() returns nullptr and nothing is touched.
@@ -1386,34 +2058,97 @@ void OnorabAudioProcessorEditor::toggleCapture()
                     editor->onCaptureFinished (file, error);
             });
         });
-    if (libraryTab != nullptr)
-    {
-        libraryTab->setCapturing (true);
-        libraryTab->setCaptureNote ("Capturing Mixer Track audio to " + fileName + "…");
-    }
+    captureStartTime = now;
+    setCaptureUI (true);
     setError ("");
+}
+
+void OnorabAudioProcessorEditor::stopCapture()
+{
+    // stopCapture joins the writer thread, so the finished callback
+    // (queued below) is already posted by the time this returns.
+    audioProcessor.stopCapture();
 }
 
 void OnorabAudioProcessorEditor::onCaptureFinished (const juce::File& file, const juce::String& error)
 {
-    if (libraryTab != nullptr)
-        libraryTab->setCapturing (false);
+    setCaptureUI (false);
     if (error.isNotEmpty())
     {
         setError ("Capture failed: " + error);
         return;
     }
-    const int dropped = audioProcessor.getDroppedSamples();
-    const int64_t samples = audioProcessor.getCapturedSamples();
-    juce::String note = "Capture saved: " + file.getFileName()
-                      + " (" + juce::String (samples) + " samples";
-    if (dropped > 0)
-        note += ", " + juce::String (dropped) + " samples dropped (writer fell behind)";
-    note += ") — press “Upload last capture” to send it to the Hub.";
-    if (libraryTab != nullptr)
-        libraryTab->setCaptureNote (note);
+    captureReviewFile = file;
+    captureUploadTarget = file;
+    if (captureReview != nullptr)
+    {
+        captureReview->showFor (file);
+        resized();
+    }
     setProgress ("Capture ready: " + file.getFileName());
-    refreshProjectsTab();
+}
+
+void OnorabAudioProcessorEditor::sendCaptureToDrive (const juce::String& name)
+{
+    if (captureReview == nullptr)
+        return;
+    if (name.isEmpty())
+    {
+        captureReview->setStatus ("Enter a name for this capture first.", true);
+        return;
+    }
+    juce::String clean = HubClient::sanitiseFileName (name);
+    if (clean.isEmpty())
+    {
+        captureReview->setStatus ("Enter a valid name (letters, numbers, spaces, - and _).", true);
+        return;
+    }
+    juce::File target = audioProcessor.getCacheDir().getChildFile (clean).withFileExtension ("wav");
+    if (target != captureReviewFile && target.existsAsFile())
+    {
+        captureReview->setStatus ("A file with that name already exists - choose another name.", true);
+        return;
+    }
+    if (target != captureReviewFile)
+    {
+        if (! captureReviewFile.moveFileTo (target))
+        {
+            captureReview->setStatus ("Could not rename the capture file.", true);
+            return;
+        }
+        captureReviewFile = target;
+    }
+    captureUploadTarget = target;
+    captureReview->setSending (true);
+    captureUploadHook = [this] (bool ok, juce::String error)
+    {
+        if (captureReview == nullptr || ! captureReview->isVisible())
+            return;
+        if (ok)
+            captureReview->setUploaded();
+        else
+        {
+            captureReview->setSending (false);
+            captureReview->setStatus ("Upload failed: " + error, true);
+        }
+    };
+    uploadLocalFileInternal (target, {}, -1);
+}
+
+void OnorabAudioProcessorEditor::closeCaptureReview()
+{
+    // The capture file stays in the cache; it can be uploaded later
+    // from the Library Upload button.
+    if (captureReview != nullptr)
+        captureReview->setVisible (false);
+}
+
+void OnorabAudioProcessorEditor::discardCapture()
+{
+    if (captureReviewFile.existsAsFile())
+        captureReviewFile.deleteFile();
+    if (captureReview != nullptr)
+        captureReview->setVisible (false);
 }
 
 void OnorabAudioProcessorEditor::applySettings (const juce::String& hubUrl, const juce::File& cacheDir)
@@ -1436,7 +2171,7 @@ void OnorabAudioProcessorEditor::applySettings (const juce::String& hubUrl, cons
     if (! cacheDir.getFullPathName().isEmpty())
         audioProcessor.setCacheDir (cacheDir);
     if (settingsTab != nullptr)
-        settingsTab->setStatus ("Saved — Hub URL and cache folder updated (saved with the project).");
+        settingsTab->setStatus ("Saved - Hub URL and cache folder updated (saved with the project).");
     checkHealth();
     refreshFiles();
 }
@@ -1446,11 +2181,96 @@ void OnorabAudioProcessorEditor::checkHealth()
     hub.checkHealth ([this] (bool ok, juce::String error, juce::String /*detail*/)
     {
         hubConnected = ok;
-        if (libraryTab != nullptr)
-            libraryTab->setSyncStatus (ok ? "Connected" : "Disconnected — Hub not reachable", ok);
+        hubDot.setDotColour (ok ? kGreen : kRed);
+        hubStatusLabel.setText (ok ? "Hub connected" : "Hub disconnected",
+                                juce::NotificationType::dontSendNotification);
         if (! ok)
             DBG ("Onorab Hub health check failed: " << error);
     });
+}
+
+void OnorabAudioProcessorEditor::refreshDriveStatus()
+{
+    hub.getAuthStatus ([this] (bool ok, juce::String, juce::String detail)
+    {
+        if (! ok)
+            return;
+        driveConnected = detail.contains ("authenticated: 1")
+                      || detail.contains ("authenticated: true");
+        if (driveConnected != prevDriveConnected && settingsTab != nullptr)
+            settingsTab->setDriveMessage (driveConnected ? "Drive connected." : "Not connected.");
+        prevDriveConnected = driveConnected;
+        driveDot.setDotColour (driveConnected ? kGreen : kGrey);
+        driveStatusLabel.setText (driveConnected ? "Drive connected" : "Drive not connected",
+                                  juce::NotificationType::dontSendNotification);
+        if (settingsTab != nullptr)
+            settingsTab->setDriveConnected (driveConnected);
+    });
+}
+
+int OnorabAudioProcessorEditor::addLocalTransfer (const juce::String& fileName,
+                                                  const juce::String& direction)
+{
+    LocalTransfer transfer;
+    transfer.fileName = fileName;
+    transfer.direction = direction;
+    transfer.status = direction == "Upload" ? "Uploading..." : "Downloading...";
+    transfer.progress = 0.0;
+    localTransfers.push_back (std::move (transfer));
+    return static_cast<int> (localTransfers.size()) - 1;
+}
+
+void OnorabAudioProcessorEditor::updateLocalTransfer (int entry, double progress,
+                                                      const juce::String& status,
+                                                      const juce::String& error, bool canRetry)
+{
+    if (entry < 0 || entry >= static_cast<int> (localTransfers.size()))
+        return;
+    auto& transfer = localTransfers[static_cast<size_t> (entry)];
+    const bool statusChanged = (transfer.status != status) || (transfer.error != error)
+                            || (transfer.canRetry != canRetry);
+    transfer.progress = juce::jlimit (0.0, 1.0, progress);
+    transfer.status = status;
+    transfer.error = error;
+    transfer.canRetry = canRetry;
+    // Throttle Transfers tab refreshes during progress callbacks: only
+    // rebuild when the bar moved by at least 5% or the state changed.
+    if (statusChanged || transfer.progress >= 1.0
+        || transfer.progress - transfer.lastReportedProgress >= 0.05)
+    {
+        transfer.lastReportedProgress = transfer.progress;
+        if (transfersTab != nullptr)
+        {
+            std::vector<TransferRow> rows;
+            for (int i = 0; i < static_cast<int> (localTransfers.size()); ++i)
+            {
+                const auto& t = localTransfers[static_cast<size_t> (i)];
+                TransferRow row;
+                row.entry = i;
+                row.fileName = t.fileName;
+                row.direction = t.direction;
+                row.status = t.status;
+                row.progress = t.progress;
+                row.error = t.error;
+                row.canRetry = t.canRetry;
+                rows.push_back (row);
+            }
+            for (const auto& t : hubTransfers)
+            {
+                TransferRow row;
+                row.entry = -1;
+                row.fileName = t.fileName.isNotEmpty() ? t.fileName : t.id;
+                row.direction = t.direction.equalsIgnoreCase ("upload") ? "Upload"
+                              : t.direction.equalsIgnoreCase ("download") ? "Download" : t.direction;
+                row.status = t.status;
+                row.progress = t.progress;
+                row.error = (t.status == "failed") ? t.message : juce::String {};
+                row.canRetry = false;
+                rows.push_back (row);
+            }
+            transfersTab->setRows (rows);
+        }
+    }
 }
 
 void OnorabAudioProcessorEditor::refreshTransfers (bool silent)
@@ -1459,11 +2279,37 @@ void OnorabAudioProcessorEditor::refreshTransfers (bool silent)
     {
         if (ok)
         {
-            transfers = std::move (newTransfers);
+            hubTransfers = std::move (newTransfers);
             if (transfersTab != nullptr)
             {
-                transfersTab->setTransfers (transfers);
-                transfersTab->setNote (juce::String (transfers.size()) + " transfer(s) from the Hub.");
+                // Force one rebuild with the fresh Hub records.
+                for (auto& t : localTransfers)
+                    t.lastReportedProgress = -1.0;
+                if (! localTransfers.empty())
+                {
+                    updateLocalTransfer (0, localTransfers.front().progress, localTransfers.front().status,
+                                         localTransfers.front().error, localTransfers.front().canRetry);
+                }
+                else
+                {
+                    std::vector<TransferRow> rows;
+                    for (const auto& t : hubTransfers)
+                    {
+                        TransferRow row;
+                        row.entry = -1;
+                        row.fileName = t.fileName.isNotEmpty() ? t.fileName : t.id;
+                        row.direction = t.direction.equalsIgnoreCase ("upload") ? "Upload"
+                                      : t.direction.equalsIgnoreCase ("download") ? "Download" : t.direction;
+                        row.status = t.status;
+                        row.progress = t.progress;
+                        row.error = (t.status == "failed") ? t.message : juce::String {};
+                        row.canRetry = false;
+                        rows.push_back (row);
+                    }
+                    transfersTab->setRows (rows);
+                }
+                transfersTab->setNote (juce::String (localTransfers.size() + hubTransfers.size())
+                                       + " transfer(s) in this session and on the Hub.");
             }
         }
         else if (! silent && transfersTab != nullptr)
@@ -1475,9 +2321,6 @@ void OnorabAudioProcessorEditor::refreshTransfers (bool silent)
 
 void OnorabAudioProcessorEditor::refreshProjectsTab()
 {
-    // Projects now show the Hub file list (with projectId), not the
-    // local cache contents — the cache is only the Take/Push staging
-    // area, not the project model.
     if (projectsTab != nullptr)
         projectsTab->setFiles (files);
 }
@@ -1495,19 +2338,4 @@ juce::String OnorabAudioProcessorEditor::getHubUrl() const
 bool OnorabAudioProcessorEditor::isCapturing() const
 {
     return audioProcessor.isCapturing();
-}
-
-bool OnorabAudioProcessorEditor::hasLastCapture() const
-{
-    return audioProcessor.getLastCaptureFile().existsAsFile();
-}
-
-juce::File OnorabAudioProcessorEditor::getLastCaptureFile() const
-{
-    return audioProcessor.getLastCaptureFile();
-}
-
-juce::File OnorabAudioProcessorEditor::getSelectedLocalFile() const
-{
-    return selectedLocalFile;
 }

@@ -20,7 +20,7 @@ void WaveformView::setFile (const juce::File& file)
 
     if (! file.existsAsFile())
     {
-        errorMessage = "No local file yet — download a file from the Cloud Library first.";
+        errorMessage = "No local file yet - press Download on this sound first.";
         thumbnail.clear();
         repaint();
         return;
@@ -42,7 +42,7 @@ void WaveformView::clear()
 
 void WaveformView::paint (juce::Graphics& g)
 {
-    g.fillAll (juce::Colour (0xff1a1d22)); // dark graphite panel
+    g.fillAll (juce::Colour (0xff16161b)); // dark panel, matches the redesign palette
 
     if (errorMessage.isNotEmpty())
     {
@@ -56,12 +56,12 @@ void WaveformView::paint (juce::Graphics& g)
     {
         g.setColour (juce::Colours::grey);
         g.setFont (13.0f);
-        g.drawFittedText ("Loading waveform…", getLocalBounds(), juce::Justification::centred, 1);
+        g.drawFittedText ("Loading waveform...", getLocalBounds(), juce::Justification::centred, 1);
         return;
     }
 
-    // Cyan waveform on graphite, matching the plugin accent scheme.
-    g.setColour (juce::Colour (0xff22d3ee));
+    // Light purple waveform, matching the redesign accent colour.
+    g.setColour (juce::Colour (0xffb7a6ff));
     thumbnail.drawChannels (g, getLocalBounds().reduced (4),
                             0.0, thumbnail.getTotalLength(), 1.0f);
 }
