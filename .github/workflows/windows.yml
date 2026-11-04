@@ -20,12 +20,21 @@ jobs:
       - name: Test Hub
         working-directory: apps/onorab-hub
         run: go test ./...
+      - name: Check distribution OAuth config
+        shell: pwsh
+        env:
+          ONORAB_OAUTH_CLIENT_ID: ${{ secrets.ONORAB_OAUTH_CLIENT_ID }}
+          ONORAB_OAUTH_CLIENT_SECRET: ${{ secrets.ONORAB_OAUTH_CLIENT_SECRET }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:ONORAB_OAUTH_CLIENT_ID)) { throw "Missing secret ONORAB_OAUTH_CLIENT_ID" }
+          if ([string]::IsNullOrWhiteSpace($env:ONORAB_OAUTH_CLIENT_SECRET)) { throw "Missing secret ONORAB_OAUTH_CLIENT_SECRET" }
       - name: Build Hub
         working-directory: apps/onorab-hub
         shell: cmd
         env:
-         ONORAB_OAUTH_CLIENT_ID: ${{ secrets.ONORAB_OAUTH_CLIENT_ID }}
-        run: go build -trimpath -ldflags "-X main.buildOAuthClientID=%ONORAB_OAUTH_CLIENT_ID%" -o onorab-hub.exe .
+          ONORAB_OAUTH_CLIENT_ID: ${{ secrets.ONORAB_OAUTH_CLIENT_ID }}
+          ONORAB_OAUTH_CLIENT_SECRET: ${{ secrets.ONORAB_OAUTH_CLIENT_SECRET }}
+        run: go build -trimpath -ldflags "-X main.buildOAuthClientID=%ONORAB_OAUTH_CLIENT_ID% -X main.buildOAuthClientSecret=%ONORAB_OAUTH_CLIENT_SECRET% -X main.buildDistribution=true" -o onorab-hub.exe .
       - name: Configure VST3
         run: cmake -S plugins/onorab-audio -B build -G "Visual Studio 17 2022" -A x64
       - name: Build VST3
@@ -41,8 +50,17 @@ jobs:
           Copy-Item -Recurse $vst3 staging/
           Copy-Item $hub staging/
           Compress-Archive -Path staging/* -DestinationPath onorab-windows.zip -Force
+      - name: Build installer
+        shell: pwsh
+        run: |
+          makensis /DSRC_DIR=staging dist/windows/installer.nsi
       - uses: actions/upload-artifact@v4
         with:
           name: onorab-windows
           path: onorab-windows.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: onorab-installer
+          path: Onorab-Installer.exe
           if-no-files-found: error
