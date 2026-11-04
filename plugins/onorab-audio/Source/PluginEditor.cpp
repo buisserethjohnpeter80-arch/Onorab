@@ -1417,6 +1417,19 @@ int TracksTab::getNumRows()
     return (int) rows.size();
 }
 
+TrackRowComponent::TrackRowComponent()
+{
+    // Light text on the dark panels: default JUCE ToggleButton/Label
+    // text is dark and would stay unreadable even once visible.
+    checkBox.setColour (juce::ToggleButton::textColourId, kText);
+    checkBox.setColour (juce::ToggleButton::tickColourId, kTextDim);
+    addAndMakeVisible (checkBox);
+    styleLabel (statusLabel, kTextDim, 12.0f);
+    addAndMakeVisible (statusLabel);
+    styleButton (retryButton);
+    addAndMakeVisible (retryButton);
+}
+
 void TracksTab::paintListBoxItem (int, juce::Graphics&, int, int, bool)
 {
     // Rows are full components (see refreshComponentForRow).

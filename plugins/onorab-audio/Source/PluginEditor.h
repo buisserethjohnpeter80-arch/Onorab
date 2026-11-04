@@ -399,6 +399,11 @@ private:
 class TrackRowComponent : public juce::Component
 {
 public:
+    // REQUIRED: without this, the row's children are never added and
+    // the row renders blank (JUCE children start invisible). That is
+    // why the Tracks list looked empty even with live Sends.
+    TrackRowComponent();
+
     void update (const juce::String& instanceIdIn, const juce::String& trackName,
                  const juce::String& status, bool selected, bool selectionEnabled,
                  bool canRetry, std::function<void (const juce::String&)> onToggle,
