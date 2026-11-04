@@ -92,6 +92,12 @@ public:
     // ---- Settings (message thread) ----
     juce::String getHubUrl() const { return hubUrl; }
     void setHubUrl (const juce::String& url) { hubUrl = url; }
+    // Take WAV format (Settings tab, persisted in state): 32 = IEEE
+    // float (default — a hot signal above 0 dB stays intact instead
+    // of hard-clipping as it would in 16-bit PCM); 16 = PCM. Any
+    // other value falls back to 32.
+    void setWavBits (int bits) { wavBits.store (bits == 16 ? 16 : 32); }
+    int getWavBits() const { return wavBits.load(); }
     juce::File getCacheDir() const { return cacheDir; }
     void setCacheDir (const juce::File& dir) { cacheDir = dir; }
 
@@ -198,6 +204,8 @@ private:
 
     juce::String hubUrl = "http://127.0.0.1:18741";
     juce::File cacheDir;
+    // Take WAV bit depth, read by the writer threads at take start.
+    std::atomic<int> wavBits { 32 };
 
     // Mode / identity (message thread; setMode / setStateInformation).
     PluginMode mode = PluginMode::Undecided;
@@ -213,6 +221,14 @@ private:
     std::atomic<bool> transportTimeKnown { false };
     std::atomic<int64_t> transportTimeSamples { 0 };
     bool wasTransportPlaying = false; // audio thread only
+    // Transport-jump guard (audio thread only, while Push-recording):
+    // last observed playhead position + block size. If the next
+    // block's playhead is not where the previous block left it
+    // (beyond tolerance), playback looped, sought, or restarted —
+    // the take must stop there instead of gluing a second pass or a
+    // distant region onto the same timeline. -1 = no reference yet.
+    std::atomic<int64_t> lastPushPlayhead { -1 };
+    std::atomic<int> lastPushBlockSamples { 0 };
 
     // Meter (audio thread writes when enabled, Send editor reads).
     std::atomic<bool> meterEnabled { false };
@@ -259,8 +275,10 @@ private:
     std::atomic<bool> pushWriterDone { false };
     std::atomic<int64_t> pushLeadSilenceFrames { 0 };
     // 0 none, 1 transport stop, 2 Finish & upload, 3 destroyed,
-    // 4 cancelled. Set before the done flag (release) so the writer
-    // always sees the reason when it exits.
+    // 4 cancelled, 5 transport jumped (loop/seek/restart: the take
+    // stops at the jump and stays aligned to its measures).
+    // Set before the done flag (release) so the writer always sees
+    // the reason when it exits.
     std::atomic<int> pushFinishReason { 0 };
     int pushIdCurrent = 0;
     juce::String pushTakeName;

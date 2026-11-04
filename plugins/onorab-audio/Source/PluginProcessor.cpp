@@ -152,6 +152,41 @@ void OnorabAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     if (timeKnownNow)
         wasTransportPlaying = playingNow;
 
+    // ---- Transport-jump guard (Send Push recording only). ----
+    // A take must be ONE continuous pass: if the playhead is not
+    // where the previous block left it (beyond tolerance), playback
+    // looped, sought, or restarted. Finalizing here keeps the take
+    // aligned to the measures it actually covers, instead of gluing
+    // a second pass or a distant region onto the same file — the
+    // cut/restart artefact that sounds amateur on re-import. The
+    // Manager tells the user to turn Loop off and record one pass.
+    // Runs after the Stop/Finish transitions above, so a normal
+    // Stop still wins over a jump in the same block.
+    if (mode == PluginMode::Send && pushRecording.load (std::memory_order_acquire))
+    {
+        if (timeKnownNow)
+        {
+            const int64_t last = lastPushPlayhead.load (std::memory_order_relaxed);
+            const int64_t diff = timeSamplesNow
+                - (last + lastPushBlockSamples.load (std::memory_order_relaxed));
+            if (last >= 0 && (diff > 4096 || diff < -4096))
+            {
+                finishPushRecordingFromAudioThread (5); // transport jumped
+            }
+            if (pushRecording.load (std::memory_order_acquire))
+            {
+                lastPushPlayhead.store (timeSamplesNow, std::memory_order_relaxed);
+                lastPushBlockSamples.store (buffer.getNumSamples(), std::memory_order_relaxed);
+            }
+        }
+        else
+        {
+            // Position unknown: drop the reference so the next known
+            // block re-syncs instead of reading as a jump.
+            lastPushPlayhead.store (-1, std::memory_order_relaxed);
+        }
+    }
+
     if (! capturing.load (std::memory_order_acquire))
         return;
 
@@ -202,6 +237,7 @@ void OnorabAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
                        nullptr);
     state.setProperty ("trackName", trackName, nullptr);
     state.setProperty ("instanceId", instanceId, nullptr);
+    state.setProperty ("wavBits", wavBits.load(), nullptr);
     juce::MemoryOutputStream stream (destData, false);
     state.writeToStream (stream);
 }
@@ -250,6 +286,11 @@ void OnorabAudioProcessor::setStateInformation (const void* data, int sizeInByte
 
         if (state.hasProperty ("instanceId"))
             instanceId = state.getProperty ("instanceId").toString();
+        // Take format: 16 stays 16; anything else (including a state
+        // saved before this setting existed) becomes the 32-bit
+        // float default.
+        if (state.hasProperty ("wavBits"))
+            wavBits.store (static_cast<int> (state.getProperty ("wavBits")) == 16 ? 16 : 32);
         if (mode == PluginMode::Send)
         {
             if (instanceId.isEmpty())
@@ -487,7 +528,7 @@ void OnorabAudioProcessor::captureWriterLoopAuto (int numChannels, double sample
         std::unique_ptr<juce::AudioFormatWriter> newWriter (
             wavFormat.createWriterFor (newStream.get(), sampleRate,
                                        static_cast<unsigned int> (numChannels),
-                                       16, {}, 0));
+                                       wavBits.load (std::memory_order_relaxed), {}, 0));
         if (newWriter == nullptr)
         {
             // The stream created an empty file; remove it so a failed
@@ -610,7 +651,7 @@ void OnorabAudioProcessor::captureWriterLoop (juce::File outFile, int numChannel
             std::unique_ptr<juce::AudioFormatWriter> writer (
                 wavFormat.createWriterFor (stream.get(), sampleRate,
                                            static_cast<unsigned int> (numChannels),
-                                           16, {}, 0));
+                                           wavBits.load (std::memory_order_relaxed), {}, 0));
             if (writer == nullptr)
             {
                 // Writer creation failed: it did not take the stream.
@@ -789,6 +830,10 @@ void OnorabAudioProcessor::startPushRecordingFromAudioThread()
     {
         pushLeadSilenceFrames.store (0, std::memory_order_relaxed);
     }
+    // No playhead reference yet: the first recorded block sets it,
+    // so a stale position from an earlier take can never read as a
+    // jump on the first block of this one.
+    lastPushPlayhead.store (-1, std::memory_order_relaxed);
     capturing.store (true, std::memory_order_release);
     pushRecording.store (true, std::memory_order_release);
     if (pushEntry != nullptr)
@@ -803,6 +848,7 @@ void OnorabAudioProcessor::finishPushRecordingFromAudioThread (int reasonCode)
     // Audio thread: reason FIRST, then the flags (release), so the
     // writer always sees the reason when it drains and exits.
     pushFinishReason.store (reasonCode, std::memory_order_relaxed);
+    lastPushPlayhead.store (-1, std::memory_order_relaxed);
     capturing.store (false, std::memory_order_release);
     pushWriterDone.store (true, std::memory_order_release);
     pushRecording.store (false, std::memory_order_release);
@@ -858,7 +904,7 @@ void OnorabAudioProcessor::captureWriterLoopPush (int numChannels, double sample
         std::unique_ptr<juce::AudioFormatWriter> newWriter (
             wavFormat.createWriterFor (stream.get(), sampleRate,
                                        static_cast<unsigned int> (numChannels),
-                                       16, {}, 0));
+                                       wavBits.load (std::memory_order_relaxed), {}, 0));
         if (newWriter == nullptr)
         {
             outFile.deleteFile();
@@ -965,6 +1011,8 @@ void OnorabAudioProcessor::captureWriterLoopPush (int numChannels, double sample
         finishedBy = "destroyed";
     else if (reason == 4)
         finishedBy = "cancelled";
+    else if (reason == 5)
+        finishedBy = "jumped";
     else if (PushSession::getInstance().isFinishRequested())
         finishedBy = "finish"; // prepared, never started, ended by Finish
     else

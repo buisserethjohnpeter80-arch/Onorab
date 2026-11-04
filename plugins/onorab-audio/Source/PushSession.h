@@ -70,6 +70,8 @@ struct PushTake
     int droppedSamples = 0;
     // "stop" (transport stopped) | "finish" (Finish & upload) |
     // "destroyed" (instance closed mid-recording: the file is partial).
+    // "jumped" (playback looped, sought, or restarted mid-take: the
+    // take stops at the jump so it stays aligned to its measures).
     juce::String finishedBy;
     int pushId = 0;
     juce::String error;

@@ -1081,6 +1081,17 @@ SettingsTab::SettingsTab (OnorabAudioProcessorEditor& editorIn)
     styleLabel (driveMessageLabel, kTextDim, 12.0f);
     addAndMakeVisible (driveMessageLabel);
 
+    styleLabel (formatLabel, kText, 13.0f);
+    formatLabel.setText ("Take format", juce::NotificationType::dontSendNotification);
+    addAndMakeVisible (formatLabel);
+    formatBox.addItem ("32-bit float (default)", 32);
+    formatBox.addItem ("16-bit", 16);
+    formatBox.onChange = [this]
+    {
+        owner.setWavFormatBits (formatBox.getSelectedId());
+    };
+    addAndMakeVisible (formatBox);
+
     styleButton (advancedButton, kPurple);
     advancedButton.onClick = [this]
     {
@@ -1155,6 +1166,12 @@ void SettingsTab::setValues (const juce::String& hubUrl, const juce::String& cac
     cacheDirBox.setText (cacheDir);
 }
 
+void SettingsTab::setFormatBits (int bits)
+{
+    formatBox.setSelectedId (bits == 16 ? 16 : 32,
+                             juce::NotificationType::dontSendNotification);
+}
+
 void SettingsTab::setStatus (const juce::String& text)
 {
     savedLabel.setText (text, juce::NotificationType::dontSendNotification);
@@ -1207,6 +1224,9 @@ void SettingsTab::resized()
     disconnectDriveButton.setBounds (connectRow.removeFromLeft (140));
     area.removeFromTop (4);
     driveMessageLabel.setBounds (area.removeFromTop (18));
+    area.removeFromTop (10);
+    formatLabel.setBounds (area.removeFromTop (20));
+    formatBox.setBounds (area.removeFromTop (28));
     area.removeFromTop (10);
     advancedButton.setBounds (area.removeFromTop (30));
     area.removeFromTop (6);
@@ -1576,6 +1596,7 @@ OnorabAudioProcessorEditor::OnorabAudioProcessorEditor (OnorabAudioProcessor& pr
 
     settingsTab->setValues (audioProcessor.getHubUrl(),
                             audioProcessor.getCacheDir().getFullPathName());
+    settingsTab->setFormatBits (audioProcessor.getWavBits());
 
     refreshFiles();
     checkHealth();
@@ -2631,6 +2652,14 @@ void OnorabAudioProcessorEditor::discardCapture()
         captureReview->setVisible (false);
 }
 
+void OnorabAudioProcessorEditor::setWavFormatBits (int bits)
+{
+    // The Settings box already shows the choice; this only stores it
+    // (the processor clamps to 16/32). The value persists in the
+    // project state on the next host save.
+    audioProcessor.setWavBits (bits);
+}
+
 void OnorabAudioProcessorEditor::applySettings (const juce::String& hubUrl, const juce::File& cacheDir)
 {
     if (hubUrl.isEmpty())
@@ -3071,7 +3100,11 @@ juce::String OnorabAudioProcessorEditor::takeRowStatus (const PushTakeState& tak
             return "Failed: " + t.error;
         return "No audio recorded";
     }
-    juce::String base = t.finishedBy == "destroyed" ? "Partial - Send closed" : "Recorded";
+    juce::String base = "Recorded";
+    if (t.finishedBy == "destroyed")
+        base = "Partial - Send closed";
+    else if (t.finishedBy == "jumped")
+        base = "Recorded - playback jumped";
     if (! takeState.uploadStarted)
         return base + " - waiting for upload";
     if (takeState.transferEntry < 0)
@@ -3349,9 +3382,11 @@ void OnorabAudioProcessorEditor::refreshTracksTab()
         }
         if (allDone)
         {
-            int uploaded = 0, failed = 0;
+            int uploaded = 0, failed = 0, jumped = 0;
             for (const auto& ts : pushTakes)
             {
+                if (ts.take.finishedBy == "jumped")
+                    ++jumped;
                 if (! ts.take.file.existsAsFile())
                     continue;
                 const juce::String st = getTransferStatus (ts.transferEntry);
@@ -3363,6 +3398,10 @@ void OnorabAudioProcessorEditor::refreshTracksTab()
             pushPhase = PushPhase::Done;
             pushNotice = "Upload complete: " + juce::String (uploaded) + " uploaded"
                 + (failed > 0 ? ", " + juce::String (failed) + " failed." : ".");
+            if (jumped > 0)
+                pushNotice += " " + juce::String (jumped)
+                    + " take(s) stopped early - playback jumped or looped. "
+                      "Turn Loop off and record in one continuous pass.";
             session.disarmAfterUpload();
         }
     }

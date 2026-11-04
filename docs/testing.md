@@ -278,6 +278,17 @@ J2–J6 are its required variations.
 - [ ] **J6. Post-effect capture.** Put a Send AFTER an EQ + compressor
       on a track: the pushed WAV must contain the processed sound,
       not the dry input.
+- [ ] **J7. Loop / seek guard.** Arm a Push with Loop ON in FL (or
+      seek the playhead mid-recording): the take STOPS at the jump —
+      it must NOT contain the loop repetition or a cut. The row
+      shows "Recorded - playback jumped" and the final notice tells
+      the user to turn Loop off and record in one continuous pass.
+      Re-imported, the take stays aligned to its measures.
+- [ ] **J8. Take format setting.** Settings shows "Take format"
+      defaulting to 32-bit float; record a Push, confirm the WAV is
+      32-bit float (hot signal above 0 dB stays intact, not
+      clipped). Switch to 16-bit, record again, confirm the WAV is
+      16-bit. Reopen the .flp: the setting persists.
 
 ## 4. Manual mobile checklist (mock mode)
 

@@ -465,3 +465,23 @@ arming a new Push stops an active take preview. The Library bottom
 player behaves like the row Play button: a Drive-only selection
 downloads first, then plays automatically, instead of dead-ending
 with "press Download first".
+
+Take format (2026-11-04): takes are 32-bit float WAVs by default
+(JUCE WAV writer, 32 bits = IEEE float), so a signal above 0 dB at
+the insert stays intact instead of hard-clipping as in 16-bit PCM.
+Settings has a "Take format" switch (32-bit float / 16-bit),
+persisted per project in the plugin state; it applies to manual
+capture, auto-capture, and Push takes.
+
+Transport-jump guard (2026-11-04, user request: no loop/seek cuts
+in takes): while a Send Push-records, processBlock compares each
+block's playhead position with the previous block's position +
+size (tolerance 4096 samples). A larger step means playback
+looped, sought, or restarted — the take finalizes immediately
+with finish reason 5 / finishedBy "jumped" instead of gluing a
+second pass or a distant region onto the same file. The take
+stays aligned to the measures it actually covers, its row shows
+"Recorded - playback jumped", and the Manager's completion
+notice tells the user to turn Loop off and record in one
+continuous pass. Normal Stop still wins over a jump in the same
+block, and an unknown playhead re-syncs instead of false-firing.

@@ -292,6 +292,7 @@ class SettingsTab : public juce::Component
 public:
     explicit SettingsTab (OnorabAudioProcessorEditor& editor);
     void setValues (const juce::String& hubUrl, const juce::String& cacheDir);
+    void setFormatBits (int bits);
     void setStatus (const juce::String& text);
     // Connected state comes only from the Hub (/auth/status, polled
     // by the editor). `account` is the Gmail the Hub learned from
@@ -322,6 +323,11 @@ private:
     StatusDot driveDot;
     juce::TextButton connectDriveButton { "Connect Google Drive" };
     juce::TextButton disconnectDriveButton { "Disconnect" };
+    // Take WAV format (user preference, not advanced): 32-bit float
+    // by default, 16-bit PCM on request. Applies to every new take
+    // (manual capture, auto-capture, Push).
+    juce::Label formatLabel;
+    juce::ComboBox formatBox;
     // Advanced section (collapsed by default): Hub URL + cache folder.
     juce::TextButton advancedButton { "Advanced" };
     bool advancedVisible = false;
@@ -563,6 +569,7 @@ public:
     void closeCaptureReview();
     void discardCapture();
     void applySettings (const juce::String& hubUrl, const juce::File& cacheDir);
+    void setWavFormatBits (int bits);
 
     // Send / Manager mode + Push workflow (message thread).
     // chooseMode is the first-open choice view: it sets the mode,
