@@ -2639,6 +2639,9 @@ void OnorabAudioProcessorEditor::checkHealth()
 {
     hub.checkHealth ([this] (bool ok, juce::String error, juce::String /*detail*/)
     {
+        // (void) error: in Release builds DBG expands to nothing, so
+        // without this the parameter reads as unreferenced (C4100).
+        (void) error;
         hubConnected = ok;
         hubDot.setDotColour (ok ? kGreen : kRed);
         hubStatusLabel.setText (ok ? "Hub connected" : "Hub disconnected",
@@ -2725,7 +2728,7 @@ void OnorabAudioProcessorEditor::refreshDriveStatus()
         const int accountPos = detail.indexOf ("account: ");
         if (accountPos >= 0)
         {
-            const int accountEnd = detail.indexOf (", oauthInProgress:", accountPos);
+            const int accountEnd = detail.indexOf (accountPos, ", oauthInProgress:");
             account = (accountEnd >= 0 ? detail.substring (accountPos + 9, accountEnd)
                                        : detail.substring (accountPos + 9)).trim();
         }
