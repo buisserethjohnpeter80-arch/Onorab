@@ -410,42 +410,20 @@ public:
     // why the Tracks list looked empty even with live Sends.
     TrackRowComponent();
 
+    // Defined in PluginEditor.cpp: the body uses kAmber / kTextDim,
+    // which are file-scope constants in the .cpp and are not visible
+    // here (defining it inline caused C2065 + C2660). The parameter
+    // is named isStatusWarning so it never hides the member of the
+    // same idea (C4458).
     void update (const juce::String& instanceIdIn, const juce::String& trackName,
                  const juce::String& status, bool selected, bool selectionEnabled,
                  bool canRetry, bool canPlay, bool isPlaying,
-                 bool canRecordAgain, bool canUploadAnyway, bool statusWarning,
+                 bool canRecordAgain, bool canUploadAnyway, bool isStatusWarning,
                  std::function<void (const juce::String&)> onToggle,
                  std::function<void (const juce::String&)> onRetry,
                  std::function<void (const juce::String&)> onPlayPause,
                  std::function<void (const juce::String&)> onRecordAgain,
-                 std::function<void (const juce::String&)> onUploadAnyway)
-    {
-        id = instanceIdIn;
-        checkBox.setButtonText (trackName);
-        checkBox.setToggleState (selected, juce::NotificationType::dontSendNotification);
-        checkBox.setEnabled (selectionEnabled);
-        statusLabel.setText (status, juce::NotificationType::dontSendNotification);
-        // An incomplete take gets an amber status; every other row
-        // keeps the dim text it always had. (The parameter shadows
-        // the member, so the member needs the qualifier.)
-        this->statusWarning = statusWarning;
-        statusLabel.setColour (juce::Label::textColourId,
-                               statusWarning ? kAmber : kTextDim);
-        retryButton.setVisible (canRetry);
-        playButton.setVisible (canPlay);
-        playButton.setPauseIcon (isPlaying);
-        recordAgainButton.setVisible (canRecordAgain);
-        uploadAnywayButton.setVisible (canUploadAnyway);
-        checkBox.onClick = [this, onToggle] { onToggle (id); };
-        retryButton.onClick = [this, onRetry] { onRetry (id); };
-        playButton.onClick = [this, onPlayPause] { onPlayPause (id); };
-        recordAgainButton.onClick = [this, onRecordAgain] { onRecordAgain (id); };
-        uploadAnywayButton.onClick = [this, onUploadAnyway] { onUploadAnyway (id); };
-        // Layout must follow visibility here: a reused row component
-        // keeps its old bounds (no resized call), so a button that
-        // just became visible would otherwise keep zero bounds.
-        resized();
-    }
+                 std::function<void (const juce::String&)> onUploadAnyway);
 
     void resized() override
     {

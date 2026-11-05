@@ -1467,6 +1467,42 @@ TrackRowComponent::TrackRowComponent()
     addAndMakeVisible (uploadAnywayButton);
 }
 
+void TrackRowComponent::update (const juce::String& instanceIdIn, const juce::String& trackName,
+                                const juce::String& status, bool selected, bool selectionEnabled,
+                                bool canRetry, bool canPlay, bool isPlaying,
+                                bool canRecordAgain, bool canUploadAnyway, bool isStatusWarning,
+                                std::function<void (const juce::String&)> onToggle,
+                                std::function<void (const juce::String&)> onRetry,
+                                std::function<void (const juce::String&)> onPlayPause,
+                                std::function<void (const juce::String&)> onRecordAgain,
+                                std::function<void (const juce::String&)> onUploadAnyway)
+{
+    id = instanceIdIn;
+    checkBox.setButtonText (trackName);
+    checkBox.setToggleState (selected, juce::NotificationType::dontSendNotification);
+    checkBox.setEnabled (selectionEnabled);
+    statusLabel.setText (status, juce::NotificationType::dontSendNotification);
+    // An incomplete take gets an amber status; every other row
+    // keeps the dim text it always had.
+    statusWarning = isStatusWarning;
+    statusLabel.setColour (juce::Label::textColourId,
+                           isStatusWarning ? kAmber : kTextDim);
+    retryButton.setVisible (canRetry);
+    playButton.setVisible (canPlay);
+    playButton.setPauseIcon (isPlaying);
+    recordAgainButton.setVisible (canRecordAgain);
+    uploadAnywayButton.setVisible (canUploadAnyway);
+    checkBox.onClick = [this, onToggle] { onToggle (id); };
+    retryButton.onClick = [this, onRetry] { onRetry (id); };
+    playButton.onClick = [this, onPlayPause] { onPlayPause (id); };
+    recordAgainButton.onClick = [this, onRecordAgain] { onRecordAgain (id); };
+    uploadAnywayButton.onClick = [this, onUploadAnyway] { onUploadAnyway (id); };
+    // Layout must follow visibility here: a reused row component
+    // keeps its old bounds (no resized call), so a button that
+    // just became visible would otherwise keep zero bounds.
+    resized();
+}
+
 void TracksTab::paintListBoxItem (int, juce::Graphics&, int, int, bool)
 {
     // Rows are full components (see refreshComponentForRow).
