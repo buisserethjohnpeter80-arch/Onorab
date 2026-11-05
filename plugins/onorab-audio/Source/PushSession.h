@@ -75,6 +75,12 @@ struct PushTake
     juce::String finishedBy;
     int pushId = 0;
     juce::String error;
+    // Real recorded length in seconds (frames / session sample rate,
+    // set by the writer) and, for a jumped take, which way the
+    // playhead went: 0 none, 1 backward (loop wrap / restart),
+    // 2 forward (seek). The Manager shows these, never invented data.
+    double durationSeconds = 0.0;
+    int jumpKind = 0;
 };
 
 class PushSession

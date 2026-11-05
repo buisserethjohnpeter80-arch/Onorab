@@ -25,6 +25,7 @@ const juce::Colour kText (0xfff2f2f5);
 const juce::Colour kTextDim (0xffa1a1aa);
 const juce::Colour kGreen (0xff22c55e);
 const juce::Colour kRed (0xffef4444);
+const juce::Colour kAmber (0xfffbbf24); // warning only: Take incomplete
 const juce::Colour kGrey (0xff71717a);
 
 void styleButton (juce::TextButton& button, juce::Colour textColour = kText)
@@ -1409,6 +1410,13 @@ juce::String TracksTab::getSelectedProject() const
     return projectBox.getText().trim();
 }
 
+void TracksTab::setSelectedProject (const juce::String& project)
+{
+    // Editable box: setText covers both a listed project and a
+    // typed name, and getSelectedProject reads it back verbatim.
+    projectBox.setText (project, juce::NotificationType::dontSendNotification);
+}
+
 void TracksTab::resized()
 {
     auto area = getLocalBounds().reduced (12);
@@ -1451,6 +1459,12 @@ TrackRowComponent::TrackRowComponent()
     // IconButton paints its own play/pause glyph (same component as
     // the Library rows); visibility is driven per row by update().
     addAndMakeVisible (playButton);
+    // Needs-review actions: visible only while the row's take is
+    // incomplete (update() owns visibility, like the other buttons).
+    styleButton (recordAgainButton);
+    addAndMakeVisible (recordAgainButton);
+    stylePrimaryButton (uploadAnywayButton);
+    addAndMakeVisible (uploadAnywayButton);
 }
 
 void TracksTab::paintListBoxItem (int, juce::Graphics&, int, int, bool)
@@ -1469,9 +1483,12 @@ juce::Component* TracksTab::refreshComponentForRow (int rowNumber, bool,
         const auto& data = rows[(size_t) rowNumber];
         row->update (data.instanceId, data.trackName, data.status, data.selected,
                      data.selectionEnabled, data.canRetry, data.canPlay, data.isPlaying,
+                     data.canRecordAgain, data.canUploadAnyway, data.statusWarning,
                      [this] (const juce::String& id) { owner.toggleTrackSelection (id); },
                      [this] (const juce::String& id) { owner.retryPushUpload (id); },
-                     [this] (const juce::String& id) { owner.toggleTakePreview (id); });
+                     [this] (const juce::String& id) { owner.toggleTakePreview (id); },
+                     [this] (const juce::String& id) { owner.recordAgain (id); },
+                     [this] (const juce::String& id) { owner.uploadTakeAnyway (id); });
     }
     return row;
 }
@@ -3097,8 +3114,8 @@ juce::String OnorabAudioProcessorEditor::takeRowStatus (const PushTakeState& tak
     if (! t.file.existsAsFile())
     {
         if (t.error.isNotEmpty())
-            return "Failed: " + t.error;
-        return "No audio recorded";
+            return "Recording failed - " + t.error;
+        return "Recording failed - no audio recorded";
     }
     juce::String base = "Recorded";
     if (t.finishedBy == "destroyed")
@@ -3178,6 +3195,98 @@ void OnorabAudioProcessorEditor::playTakePreview (const juce::String& instanceId
     refreshTracksTab();
 }
 
+// ---- Incomplete takes: Needs review (no automatic upload) ----
+
+bool OnorabAudioProcessorEditor::takeNeedsReview (const PushTake& take) const
+{
+    // Only a take with a playable local WAV can wait for review.
+    // A take with no file is a failure, not a review candidate.
+    if (! take.file.existsAsFile())
+        return false;
+    if (take.finishedBy == "jumped" || take.finishedBy == "destroyed")
+        return true;
+    if (take.droppedSamples > 0)
+        return true;
+    return false;
+}
+
+juce::String OnorabAudioProcessorEditor::takeIncompleteReason (const PushTake& take) const
+{
+    if (! take.file.existsAsFile())
+        return take.error.isNotEmpty() ? take.error : "no audio recorded";
+    if (take.finishedBy == "jumped")
+        return take.jumpKind == 2 ? "Playhead moved" : "Playback looped";
+    if (take.finishedBy == "destroyed")
+        return "Send closed";
+    if (take.droppedSamples > 0)
+        return "Samples lost";
+    return "Incomplete";
+}
+
+void OnorabAudioProcessorEditor::clearPushTakesExceptNeedsReview()
+{
+    // A fresh Push (or a Cancel) forgets finished takes — except a
+    // take the user has not decided on yet. Its WAV stays in the
+    // cache either way; this only keeps its row and its actions.
+    pushTakes.erase (std::remove_if (pushTakes.begin(), pushTakes.end(),
+        [] (const PushTakeState& ts) { return ! ts.needsReview; }),
+        pushTakes.end());
+}
+
+void OnorabAudioProcessorEditor::recordAgain (const juce::String& instanceId)
+{
+    if (pushPhase != PushPhase::Idle && pushPhase != PushPhase::Done)
+        return;
+    // The Send must still be live: only a live Send can record.
+    const auto sends = PushSession::getInstance().getSends();
+    const bool live = std::any_of (sends.begin(), sends.end(),
+        [&instanceId] (const PushSession::SendSnapshot& s)
+        { return s.instanceId == instanceId; });
+    if (! live)
+    {
+        pushNotice = "Send is gone - add Onorab to a Mixer insert and choose Send.";
+        refreshTracksTab();
+        return;
+    }
+    // Same project as the Push this take came from (the tab may have
+    // been changed since). The old take stays in the list through
+    // the re-record — clearPushTakesExceptNeedsReview keeps it, and
+    // the drain replaces it only when the new take arrives — so the
+    // first WAV is never erased by the new attempt.
+    if (tracksTab != nullptr && pushProject.isNotEmpty())
+        tracksTab->setSelectedProject (pushProject);
+    tracksSelected.clear();
+    tracksSelected.insert (instanceId);
+    onPushSelected();
+}
+
+void OnorabAudioProcessorEditor::uploadTakeAnyway (const juce::String& instanceId)
+{
+    if (pushPhase != PushPhase::Idle && pushPhase != PushPhase::Done)
+        return;
+    for (auto& ts : pushTakes)
+    {
+        if (ts.take.instanceId != instanceId || ! ts.needsReview
+            || ! ts.take.file.existsAsFile() || ts.uploadStarted)
+            continue;
+        // Mark started BEFORE the call: a second click can never
+        // start a second upload of the same file, and the button
+        // hides as soon as the row refreshes.
+        ts.uploadStarted = true;
+        ts.needsReview = false; // the user reviewed it: upload now
+        ts.transferEntry = uploadLocalFileInternal (ts.take.file, pushProject, -1);
+        if (ts.transferEntry < 0)
+        {
+            // Could not start: stay reviewable, user can try again.
+            ts.uploadStarted = false;
+            ts.needsReview = true;
+            pushNotice = "Upload could not start for \"" + ts.take.file.getFileName() + "\".";
+        }
+        refreshTracksTab();
+        return;
+    }
+}
+
 void OnorabAudioProcessorEditor::onPushSelected()
 {
     if (pushPhase != PushPhase::Idle && pushPhase != PushPhase::Done)
@@ -3242,7 +3351,10 @@ void OnorabAudioProcessorEditor::onPushSelected()
         pushArmedIds = prepared;
         pushProject = project;
         pushIdCurrent = session.getPushId();
-        pushTakes.clear();
+        // A take the user has not decided on survives a fresh Push;
+        // the drain replaces it only when a new take for the same
+        // Send arrives. Every other take is forgotten here.
+        clearPushTakesExceptNeedsReview();
         // A take preview must not outlive its take: stop it before
         // the new Push replaces the take list (a Library preview is
         // untouched — playingTakeId is empty while one plays).
@@ -3295,7 +3407,9 @@ void OnorabAudioProcessorEditor::onPushCancel()
     pushPhase = PushPhase::Idle;
     pushArmedIds.clear();
     pushArmedNames.clear();
-    pushTakes.clear();
+    // Cancelling a re-record must not lose the take it was meant to
+    // replace: an undecided take stays until the user decides.
+    clearPushTakesExceptNeedsReview();
     pushNotice.clear();
     refreshTracksTab();
 }
@@ -3321,7 +3435,15 @@ void OnorabAudioProcessorEditor::refreshTracksTab()
         {
             if (t.pushId != pushIdCurrent)
                 continue;
-            pushTakes.push_back ({ t, -1, false });
+            // A new take for a Send supersedes the preserved
+            // incomplete take for that Send (Record again): the old
+            // WAV stays in the cache folder, but the row tracks the
+            // latest take. Incomplete takes are flagged here so they
+            // are never uploaded automatically below.
+            pushTakes.erase (std::remove_if (pushTakes.begin(), pushTakes.end(),
+                [&t] (const PushTakeState& ts) { return ts.take.instanceId == t.instanceId; }),
+                pushTakes.end());
+            pushTakes.push_back ({ t, -1, false, takeNeedsReview (t) });
         }
     }
 
@@ -3357,6 +3479,12 @@ void OnorabAudioProcessorEditor::refreshTracksTab()
             pushPhase = PushPhase::Uploading;
             for (auto& ts : pushTakes)
             {
+                // Incomplete takes stay local: no automatic upload
+                // for a WAV the user has not reviewed. Complete
+                // takes upload as before and are never blocked by
+                // a take that needs review.
+                if (ts.needsReview)
+                    continue;
                 if (ts.take.file.existsAsFile() && ! ts.uploadStarted)
                 {
                     ts.uploadStarted = true;
@@ -3382,13 +3510,26 @@ void OnorabAudioProcessorEditor::refreshTracksTab()
         }
         if (allDone)
         {
-            int uploaded = 0, failed = 0, jumped = 0;
+            // Exact result for THIS Push only: a take preserved from
+            // an earlier Push (Record again) is not counted here.
+            int uploaded = 0, failed = 0, needsReview = 0, jumped = 0, total = 0;
             for (const auto& ts : pushTakes)
             {
+                if (ts.take.pushId != pushIdCurrent)
+                    continue;
+                ++total;
                 if (ts.take.finishedBy == "jumped")
                     ++jumped;
-                if (! ts.take.file.existsAsFile())
+                if (ts.needsReview)
+                {
+                    ++needsReview;
                     continue;
+                }
+                if (! ts.take.file.existsAsFile())
+                {
+                    ++failed;
+                    continue;
+                }
                 const juce::String st = getTransferStatus (ts.transferEntry);
                 if (st == "Done")
                     ++uploaded;
@@ -3396,8 +3537,21 @@ void OnorabAudioProcessorEditor::refreshTracksTab()
                     ++failed;
             }
             pushPhase = PushPhase::Done;
-            pushNotice = "Upload complete: " + juce::String (uploaded) + " uploaded"
-                + (failed > 0 ? ", " + juce::String (failed) + " failed." : ".");
+            if (total == 0)
+            {
+                pushNotice = "No takes were recorded.";
+            }
+            else
+            {
+                // U+00B7 as bytes: the source must stay ASCII-safe
+                // (no /utf-8), so the middle dot is written escaped.
+                pushNotice = juce::String (uploaded) + " of " + juce::String (total)
+                    + " uploaded";
+                if (needsReview > 0)
+                    pushNotice += " \xC2\xB7 " + juce::String (needsReview) + " needs review";
+                if (failed > 0)
+                    pushNotice += ", " + juce::String (failed) + " failed";
+            }
             if (jumped > 0)
                 pushNotice += " " + juce::String (jumped)
                     + " take(s) stopped early - playback jumped or looped. "
@@ -3471,12 +3625,29 @@ void OnorabAudioProcessorEditor::refreshTracksTab()
             ? std::find (pushArmedIds.begin(), pushArmedIds.end(), id) != pushArmedIds.end()
             : tracksSelected.find (id) != tracksSelected.end();
         row.selectionEnabled = ! selectionLocked;
+        // An incomplete take shows its own status (name + reason +
+        // recorded length, amber) instead of the upload status, and
+        // its review actions appear only while the Push is not
+        // running. A take with no WAV shows Recording failed.
+        const bool reviewTake = hasTake && takeIt->needsReview;
+        const bool failedTake = hasTake && ! takeIt->take.file.existsAsFile();
+        row.statusWarning = reviewTake || failedTake;
+        const bool phaseAllowsActions = pushPhase == PushPhase::Idle
+            || pushPhase == PushPhase::Done;
+        row.canRecordAgain = reviewTake && liveIt != liveById.end() && phaseAllowsActions;
+        row.canUploadAnyway = reviewTake && ! takeIt->uploadStarted && phaseAllowsActions;
         if (liveIt != liveById.end())
         {
             row.trackName = liveIt->second.trackName;
             if (hasTake)
             {
-                row.status = takeRowStatus (*takeIt);
+                if (reviewTake)
+                    row.status = "Take incomplete - " + takeIncompleteReason (takeIt->take)
+                        + " - " + formatDuration (takeIt->take.durationSeconds);
+                else if (failedTake)
+                    row.status = "Recording failed - " + takeIncompleteReason (takeIt->take);
+                else
+                    row.status = takeRowStatus (*takeIt);
             }
             else if (liveIt->second.status == 2)
             {
@@ -3501,9 +3672,17 @@ void OnorabAudioProcessorEditor::refreshTracksTab()
                 ? pushArmedNames[id] : id;
             if (hasTake)
             {
-                row.status = takeRowStatus (*takeIt);
-                if (takeIt->take.finishedBy == "destroyed")
-                    row.status += " - Send closed";
+                if (reviewTake)
+                    row.status = "Take incomplete - " + takeIncompleteReason (takeIt->take)
+                        + " - " + formatDuration (takeIt->take.durationSeconds);
+                else if (failedTake)
+                    row.status = "Recording failed - " + takeIncompleteReason (takeIt->take);
+                else
+                {
+                    row.status = takeRowStatus (*takeIt);
+                    if (takeIt->take.finishedBy == "destroyed")
+                        row.status += " - Send closed";
+                }
             }
             else
             {

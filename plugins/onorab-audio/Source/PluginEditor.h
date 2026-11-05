@@ -413,21 +413,34 @@ public:
     void update (const juce::String& instanceIdIn, const juce::String& trackName,
                  const juce::String& status, bool selected, bool selectionEnabled,
                  bool canRetry, bool canPlay, bool isPlaying,
+                 bool canRecordAgain, bool canUploadAnyway, bool statusWarning,
                  std::function<void (const juce::String&)> onToggle,
                  std::function<void (const juce::String&)> onRetry,
-                 std::function<void (const juce::String&)> onPlayPause)
+                 std::function<void (const juce::String&)> onPlayPause,
+                 std::function<void (const juce::String&)> onRecordAgain,
+                 std::function<void (const juce::String&)> onUploadAnyway)
     {
         id = instanceIdIn;
         checkBox.setButtonText (trackName);
         checkBox.setToggleState (selected, juce::NotificationType::dontSendNotification);
         checkBox.setEnabled (selectionEnabled);
         statusLabel.setText (status, juce::NotificationType::dontSendNotification);
+        // An incomplete take gets an amber status; every other row
+        // keeps the dim text it always had. (The parameter shadows
+        // the member, so the member needs the qualifier.)
+        this->statusWarning = statusWarning;
+        statusLabel.setColour (juce::Label::textColourId,
+                               statusWarning ? kAmber : kTextDim);
         retryButton.setVisible (canRetry);
         playButton.setVisible (canPlay);
         playButton.setPauseIcon (isPlaying);
+        recordAgainButton.setVisible (canRecordAgain);
+        uploadAnywayButton.setVisible (canUploadAnyway);
         checkBox.onClick = [this, onToggle] { onToggle (id); };
         retryButton.onClick = [this, onRetry] { onRetry (id); };
         playButton.onClick = [this, onPlayPause] { onPlayPause (id); };
+        recordAgainButton.onClick = [this, onRecordAgain] { onRecordAgain (id); };
+        uploadAnywayButton.onClick = [this, onUploadAnyway] { onUploadAnyway (id); };
         // Layout must follow visibility here: a reused row component
         // keeps its old bounds (no resized call), so a button that
         // just became visible would otherwise keep zero bounds.
@@ -441,16 +454,23 @@ public:
             playButton.setBounds (area.removeFromLeft (28));
         if (retryButton.isVisible())
             retryButton.setBounds (area.removeFromRight (110));
-        statusLabel.setBounds (area.removeFromRight (220));
+        if (uploadAnywayButton.isVisible())
+            uploadAnywayButton.setBounds (area.removeFromRight (120));
+        if (recordAgainButton.isVisible())
+            recordAgainButton.setBounds (area.removeFromRight (110));
+        statusLabel.setBounds (area.removeFromRight (statusWarning ? 320 : 220));
         checkBox.setBounds (area);
     }
 
 private:
     juce::String id;
+    bool statusWarning = false;
     juce::ToggleButton checkBox;
     juce::Label statusLabel;
     juce::TextButton retryButton { "Retry upload" };
     IconButton playButton;
+    juce::TextButton recordAgainButton { "Record again" };
+    juce::TextButton uploadAnywayButton { "Upload anyway" };
 };
 
 // Tracks tab (Manager mode, the default tab): the live Sends of THIS FL
@@ -475,6 +495,14 @@ public:
         // preview transport (one preview at a time, Library or Tracks).
         bool canPlay = false;
         bool isPlaying = false;
+        // Needs-review actions: shown ONLY while this row's take is
+        // incomplete (loop/seek, Send closed, or samples lost) and
+        // the Push is not running. Record again re-records the track;
+        // Upload anyway sends the partial WAV as-is.
+        bool canRecordAgain = false;
+        bool canUploadAnyway = false;
+        // Amber status text for an incomplete take; dim otherwise.
+        bool statusWarning = false;
     };
 
     struct View
@@ -496,6 +524,7 @@ public:
     explicit TracksTab (OnorabAudioProcessorEditor& editor);
     void setView (const View& view);
     juce::String getSelectedProject() const;
+    void setSelectedProject (const juce::String& project);
     void resized() override;
 
     // ListBoxModel (custom row components; paintListBoxItem is unused
@@ -580,6 +609,15 @@ public:
     void onPushCancel();
     void toggleTrackSelection (const juce::String& instanceId);
     void retryPushUpload (const juce::String& instanceId);
+    // Incomplete takes: kept local for review instead of being
+    // uploaded automatically. Record again re-arms one track in the
+    // same project (the old WAV is never deleted); Upload anyway
+    // sends the partial WAV to this Push's project.
+    bool takeNeedsReview (const PushTake& take) const;
+    juce::String takeIncompleteReason (const PushTake& take) const;
+    void clearPushTakesExceptNeedsReview();
+    void recordAgain (const juce::String& instanceId);
+    void uploadTakeAnyway (const juce::String& instanceId);
     // Take preview (Tracks rows): plays the finished take's local WAV
     // through the shared preview transport, so the musician can hear
     // exactly what the Send recorded before trusting the upload.
@@ -732,6 +770,12 @@ private:
         PushTake take;
         int transferEntry = -1;
         bool uploadStarted = false;
+        // Needs review: the take is incomplete (loop/seek, Send
+        // closed, or samples lost) but its WAV exists locally. It is
+        // NEVER uploaded automatically; the user decides per take
+        // (Listen / Record again / Upload anyway). Cleared when the
+        // user uploads it anyway.
+        bool needsReview = false;
     };
     std::vector<PushTakeState> pushTakes;
     juce::String pushNotice;

@@ -485,3 +485,29 @@ stays aligned to the measures it actually covers, its row shows
 notice tells the user to turn Loop off and record in one
 continuous pass. Normal Stop still wins over a jump in the same
 block, and an unknown playhead re-syncs instead of false-firing.
+
+Needs review (2026-11-05, branch needs-review): an incomplete
+take is never uploaded automatically. The writer stores the real
+duration (frames / session sample rate) and the jump direction
+(1 backward = loop/restart, 2 forward = seek) on the take; the
+Manager flags it at drain time when finishedBy is "jumped" or
+"destroyed", or when samples were dropped. Its WAV stays in the
+local cache and the Tracks row shows "Take incomplete - <reason>
+- <duration>" in amber, with three actions that appear only
+while the take needs review: Listen (the existing row Play
+button, same shared preview transport), Record again (re-arms
+that one Send in the same project and asks for Play in FL; the
+old take survives the re-record and is replaced only when the
+new take drains, its WAV is never deleted), and Upload anyway
+(sends the partial WAV to this Push's project; uploadStarted is
+set before the call so a second click cannot duplicate it; a
+failed upload offers the existing Retry on the same WAV). A take
+with no WAV shows "Recording failed - <reason>" instead. The
+Push result is exact and counts only this Push's takes: "2 of 2
+uploaded", or "1 of 2 uploaded - 1 needs review" (middle dot
+written as UTF-8 bytes, the source stays ASCII-safe). Complete
+takes are never blocked by a take that needs review. All of
+this reuses the existing Tracks row, preview transport, cache,
+and upload machinery; no new panel, tab, or screen, and no
+change to OAuth, the installer, or track order. A normal
+successful Push looks exactly as before.

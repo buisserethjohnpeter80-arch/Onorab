@@ -280,6 +280,11 @@ private:
     // Set before the done flag (release) so the writer always sees
     // the reason when it exits.
     std::atomic<int> pushFinishReason { 0 };
+    // Jump direction for a jumped take (audio thread sets it just
+    // before the finish call; the writer reads it): 0 none,
+    // 1 playhead went backward (loop wrap / restart),
+    // 2 playhead went forward (seek).
+    std::atomic<int> pushJumpKind { 0 };
     int pushIdCurrent = 0;
     juce::String pushTakeName;
     int pushDroppedBaseline = 0;

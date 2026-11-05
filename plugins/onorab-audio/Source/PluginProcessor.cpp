@@ -171,6 +171,10 @@ void OnorabAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                 - (last + lastPushBlockSamples.load (std::memory_order_relaxed));
             if (last >= 0 && (diff > 4096 || diff < -4096))
             {
+                // Backward = loop wrap or restart; forward = seek.
+                // The writer stores the direction on the take so the
+                // Manager can name the reason honestly.
+                pushJumpKind.store (diff < 0 ? 1 : 2, std::memory_order_relaxed);
                 finishPushRecordingFromAudioThread (5); // transport jumped
             }
             if (pushRecording.load (std::memory_order_acquire))
@@ -834,6 +838,7 @@ void OnorabAudioProcessor::startPushRecordingFromAudioThread()
     // so a stale position from an earlier take can never read as a
     // jump on the first block of this one.
     lastPushPlayhead.store (-1, std::memory_order_relaxed);
+    pushJumpKind.store (0, std::memory_order_relaxed);
     capturing.store (true, std::memory_order_release);
     pushRecording.store (true, std::memory_order_release);
     if (pushEntry != nullptr)
@@ -1025,11 +1030,15 @@ void OnorabAudioProcessor::captureWriterLoopPush (int numChannels, double sample
     // armed track instead of waiting forever.
     if (finishedBy != "cancelled")
     {
+        const int jumpKind = pushJumpKind.load (std::memory_order_relaxed);
+        const double durationSeconds = sampleRate > 0
+            ? static_cast<double> (totalFrames) / sampleRate : 0.0;
         if (fileCreated && writeError.isEmpty() && outFile.existsAsFile())
         {
             PushSession::getInstance().queueTake (
                 { instanceId, pushTakeName, outFile, totalFrames,
-                  dropped > 0 ? dropped : 0, finishedBy, pushId, {} });
+                  dropped > 0 ? dropped : 0, finishedBy, pushId, {},
+                  durationSeconds, jumpKind });
         }
         else if (! writeError.isEmpty())
         {
@@ -1037,13 +1046,15 @@ void OnorabAudioProcessor::captureWriterLoopPush (int numChannels, double sample
                 outFile.deleteFile();
             PushSession::getInstance().queueTake (
                 { instanceId, pushTakeName, {}, 0,
-                  dropped > 0 ? dropped : 0, finishedBy, pushId, writeError });
+                  dropped > 0 ? dropped : 0, finishedBy, pushId, writeError,
+                  0.0, jumpKind });
         }
         else
         {
             PushSession::getInstance().queueTake (
                 { instanceId, pushTakeName, {}, 0,
-                  dropped > 0 ? dropped : 0, finishedBy, pushId, {} });
+                  dropped > 0 ? dropped : 0, finishedBy, pushId, {},
+                  0.0, jumpKind });
         }
     }
 

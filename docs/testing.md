@@ -289,6 +289,19 @@ J2–J6 are its required variations.
       32-bit float (hot signal above 0 dB stays intact, not
       clipped). Switch to 16-bit, record again, confirm the WAV is
       16-bit. Reopen the .flp: the setting persists.
+- [ ] **J9. Needs review (branch needs-review).** Two Sends, one
+      Push. Loop the playback (or seek mid-recording) so one take
+      stops early: that take must NOT upload automatically. Its
+      row shows "Take incomplete - Playback looped - <duration>"
+      in amber, the other take uploads normally, and the final
+      notice reads "1 of 2 uploaded - 1 needs review". Press the
+      row Play button (Listen): it plays the partial WAV.
+- [ ] **J10. Record again / Upload anyway.** From J9's incomplete
+      take: press Upload anyway — it uploads once (a second click
+      cannot duplicate it); break the network and confirm Retry
+      upload appears on the same WAV. Then press Record again with
+      Loop off: a new take records, the old WAV is still in the
+      cache, and the row now tracks the new take.
 
 ## 4. Manual mobile checklist (mock mode)
 
